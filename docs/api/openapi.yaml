@@ -1,0 +1,1990 @@
+openapi: 3.1.0
+info:
+  title: Jarlore API
+  version: 0.1.0
+  summary: HTTP JSON API for Jarlore, a personal fermentation workspace.
+  description: |
+    Contract between the Jarlore Next.js frontend and the Jarlore backend (jarlore-be).
+    No implementation exists yet. This file is the source of truth for request and
+    response shapes. See docs/architecture/API_CONTRACT.md for conventions.
+
+    - JSON fields are camelCase. IDs are opaque strings (UUIDs). Timestamps are ISO 8601 UTC.
+    - Errors use RFC 9457 `application/problem+json` (schema `Problem`).
+    - Another user's resource is reported as 404, never 403.
+    - The API never labels a ferment "safe", "ready" or "passed".
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+  contact:
+    name: Jarlore
+servers:
+  - url: https://api.jarlore.example
+    description: Production (placeholder host, to be confirmed). Local development uses the same paths on the port set by PORT.
+security:
+  - bearerAuth: []
+tags:
+  - name: Me
+    description: Profile, preferences and account deletion.
+  - name: Reference data
+    description: System seed data (fermentation types).
+  - name: Today
+    description: Dashboard projection.
+  - name: Batches
+    description: F1 batches, lifecycle and Brew Again.
+  - name: Bottles
+    description: F2 bottles (bottle-level experiments).
+  - name: Logs
+    description: Journal entries and measurements.
+  - name: Recipes
+    description: Recipes and immutable recipe versions.
+  - name: Compare
+    description: Side-by-side comparison and reference batch.
+  - name: Measurements
+    description: User-defined measurement definitions.
+  - name: Reminders
+    description: Reminders and the private calendar feed.
+  - name: Exports
+    description: Full data export.
+  - name: Billing
+    description: Entitlements, checkout and the customer portal.
+  - name: Webhooks
+    description: Inbound webhooks from the Merchant of Record.
+  - name: Public
+    description: Unauthenticated, token-addressed resources.
+
+paths:
+  # ---------------------------------------------------------------- Me
+  /v1/me:
+    get:
+      tags: [Me]
+      operationId: getMe
+      summary: Get the current user's profile (created lazily on first call)
+      responses:
+        '200':
+          description: Profile
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    patch:
+      tags: [Me]
+      operationId: updateMe
+      summary: Update display name and preferences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateMeRequest' }
+      responses:
+        '200':
+          description: Updated profile
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    delete:
+      tags: [Me]
+      operationId: deleteMe
+      summary: Request account deletion (two-step, asynchronous)
+      description: |
+        Step 1: call without `confirmationToken`. The API emails a single-use token
+        (valid 30 minutes) and returns `status: confirmation_sent`.
+        Step 2: call again with the token. The API schedules deletion and returns
+        `status: scheduled`. A background job deletes all data, stored files and the
+        auth identity, and cancels any active subscription with the billing provider.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeleteMeRequest' }
+      responses:
+        '202':
+          description: Confirmation sent, or deletion scheduled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeleteMeResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ---------------------------------------------------------------- Reference data
+  /v1/fermentation-types:
+    get:
+      tags: [Reference data]
+      operationId: listFermentationTypes
+      summary: List system fermentation types (read-only seed data)
+      responses:
+        '200':
+          description: Fermentation types
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/FermentationType' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------------------------------------------------------- Today
+  /v1/today:
+    get:
+      tags: [Today]
+      operationId: getToday
+      summary: Dashboard projection for the current user's local day
+      responses:
+        '200':
+          description: Today view
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TodayResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ---------------------------------------------------------------- Batches
+  /v1/batches:
+    get:
+      tags: [Batches]
+      operationId: listBatches
+      summary: List batches
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/BatchStatus' }
+        - name: stage
+          in: query
+          schema: { $ref: '#/components/schemas/BatchStage' }
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/FermentationTypeId' }
+        - name: recipeId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: q
+          in: query
+          description: Case-insensitive search over name, code and hypothesis.
+          schema: { type: string, maxLength: 100 }
+        - name: archived
+          in: query
+          description: false (default) excludes archived batches, true returns only archived ones.
+          schema: { type: boolean, default: false }
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [started_desc, started_asc, rating_desc, updated_desc]
+            default: started_desc
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of batch summaries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BatchSummaryPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    post:
+      tags: [Batches]
+      operationId: createBatch
+      summary: Create a batch (blank, from a recipe version, or Brew Again from a batch)
+      description: |
+        Applies the recipe version rule (see DOMAIN_MODEL.md, "Version rule"):
+        when `source` resolves to a recipe version and recipe-level fields
+        (ingredients per litre, `params.targetF1Days`) differ, the server creates
+        recipe version n+1 in the same transaction and pins the batch to it.
+        Batch-level differences (volume, vessel, room temperature, starter source)
+        are recorded as deviations and never create a version.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBatchRequest' }
+      responses:
+        '201':
+          description: Created batch
+          headers:
+            Location:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/batches/diff-preview:
+    post:
+      tags: [Batches]
+      operationId: previewBatchDiff
+      summary: Live diff between a base (batch, bottle or recipe version) and a draft batch
+      description: Read-only. Nothing is persisted. Used by the Brew Again form.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DiffPreviewRequest' }
+      responses:
+        '200':
+          description: Diff rows
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiffResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/batches/{batchId}:
+    parameters:
+      - $ref: '#/components/parameters/BatchId'
+    get:
+      tags: [Batches]
+      operationId: getBatch
+      summary: Get a batch with bottles, last log and next reminder
+      responses:
+        '200':
+          description: Batch
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Batches]
+      operationId: updateBatch
+      summary: Update mutable batch fields only
+      description: |
+        Only `name`, `vessel`, `isReference` and `params.roomTempC` are mutable.
+        Any other field returns 422 `field_immutable`. `isReference: true` requires
+        status `finished`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateBatchRequest' }
+      responses:
+        '200':
+          description: Updated batch
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/batches/{batchId}/snapshot:
+    parameters:
+      - $ref: '#/components/parameters/BatchId'
+    get:
+      tags: [Batches]
+      operationId: getBatchSnapshot
+      summary: Frozen copy of the recipe version used when the batch was created
+      responses:
+        '200':
+          description: Snapshot and derived deviations
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BatchSnapshot' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Batch not found, or batch was not created from a recipe version (code `snapshot_not_found`)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/batches/{batchId}/brew-again:
+    parameters:
+      - $ref: '#/components/parameters/BatchId'
+    get:
+      tags: [Batches]
+      operationId: getBrewAgainDraft
+      summary: Pre-filled create request for brewing this batch again
+      responses:
+        '200':
+          description: Draft
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrewAgainResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/batches/{batchId}/bottles:
+    parameters:
+      - $ref: '#/components/parameters/BatchId'
+    post:
+      tags: [Bottles]
+      operationId: createBottles
+      summary: Split F1 into F2 bottles
+      description: |
+        Moves the batch to stage `f2` (first call), writes a `stage_change` log entry
+        and creates daily burp reminders. Calling again while in `f2` adds bottles.
+        Allowed only for active batches whose fermentation type has an `f2` stage.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBottlesRequest' }
+      responses:
+        '201':
+          description: Updated batch including the new bottles
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/batches/{batchId}/logs:
+    parameters:
+      - $ref: '#/components/parameters/BatchId'
+    get:
+      tags: [Logs]
+      operationId: listBatchLogs
+      summary: List log entries (newest first, soft-deleted entries excluded)
+      parameters:
+        - name: bottleId
+          in: query
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of log entries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LogEntryPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Logs]
+      operationId: createBatchLogs
+      summary: Record an observation (batch, one bottle, or several bottles)
+      description: |
+        Idempotent through the required `Idempotency-Key` header. With `bottleIds`
+        ("burp all") one entry is created per bottle, all in one transaction.
+        `bottleId` and `bottleIds` are mutually exclusive. `kind: stage_change` is
+        server-generated only and is rejected here.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyRequired'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateLogRequest' }
+      responses:
+        '201':
+          description: Created entries (replayed responses carry `Idempotent-Replayed true`)
+          headers:
+            Idempotent-Replayed:
+              schema: { type: string, enum: ['true'] }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreateLogsResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/batches/{batchId}/finish:
+    parameters:
+      - $ref: '#/components/parameters/BatchId'
+    post:
+      tags: [Batches]
+      operationId: finishBatch
+      summary: Finish and rate a batch
+      description: |
+        Sets status `finished`, stage `done`, locks ingredients and parameters
+        (except the PATCH-able fields), finishes any still-open bottles without a
+        rating, and dismisses pending reminders.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinishBatchRequest' }
+      responses:
+        '200':
+          description: Finished batch
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/batches/{batchId}/discard:
+    parameters:
+      - $ref: '#/components/parameters/BatchId'
+    post:
+      tags: [Batches]
+      operationId: discardBatch
+      summary: Discard a batch (keeps all history)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DiscardBatchRequest' }
+      responses:
+        '200':
+          description: Discarded batch
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/batches/{batchId}/archive:
+    parameters:
+      - $ref: '#/components/parameters/BatchId'
+    post:
+      tags: [Batches]
+      operationId: archiveBatch
+      summary: Hide a finished or discarded batch from default lists
+      responses:
+        '200':
+          description: Archived batch
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/batches/{batchId}/unarchive:
+    parameters:
+      - $ref: '#/components/parameters/BatchId'
+    post:
+      tags: [Batches]
+      operationId: unarchiveBatch
+      summary: Restore an archived batch to default lists
+      responses:
+        '200':
+          description: Unarchived batch
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/batches/{batchId}/save-as-recipe:
+    parameters:
+      - $ref: '#/components/parameters/BatchId'
+    post:
+      tags: [Recipes]
+      operationId: saveBatchAsRecipe
+      summary: Create recipe v1 from a batch, or a new version of an existing recipe
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SaveAsRecipeRequest' }
+      responses:
+        '201':
+          description: Recipe (its `latestVersion` is the version just created)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/batches/{batchId}/reference:
+    parameters:
+      - $ref: '#/components/parameters/BatchId'
+    get:
+      tags: [Compare]
+      operationId: getReferenceBatch
+      summary: Last good batch of the same recipe (or same type) to compare against
+      responses:
+        '200':
+          description: Reference batch, or null when none exists
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReferenceResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/EntitlementRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Bottles
+  /v1/bottles/{bottleId}:
+    parameters:
+      - $ref: '#/components/parameters/BottleId'
+    patch:
+      tags: [Bottles]
+      operationId: updateBottle
+      summary: Update a bottle (label, flavour, additions, conditions, or move to chilled)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateBottleRequest' }
+      responses:
+        '200':
+          description: Updated bottle
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bottle' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/bottles/{bottleId}/finish:
+    parameters:
+      - $ref: '#/components/parameters/BottleId'
+    post:
+      tags: [Bottles]
+      operationId: finishBottle
+      summary: Finish and rate one bottle
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinishBottleRequest' }
+      responses:
+        '200':
+          description: Finished bottle
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bottle' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ---------------------------------------------------------------- Logs
+  /v1/logs/{logId}:
+    parameters:
+      - name: logId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Logs]
+      operationId: deleteLog
+      summary: Soft-delete a log entry (and hide its measurements)
+      responses:
+        '204':
+          description: Deleted (also returned when already deleted)
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ---------------------------------------------------------------- Recipes
+  /v1/recipes:
+    get:
+      tags: [Recipes]
+      operationId: listRecipes
+      summary: List recipes
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 100 }
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/FermentationTypeId' }
+        - name: archived
+          in: query
+          schema: { type: boolean, default: false }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of recipes
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecipePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/recipes/{recipeId}:
+    parameters:
+      - $ref: '#/components/parameters/RecipeId'
+    get:
+      tags: [Recipes]
+      operationId: getRecipe
+      summary: Get a recipe with its latest version
+      responses:
+        '200':
+          description: Recipe
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Recipes]
+      operationId: updateRecipe
+      summary: Rename or archive/unarchive a recipe (versions are never edited)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateRecipeRequest' }
+      responses:
+        '200':
+          description: Updated recipe
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/recipes/{recipeId}/versions:
+    parameters:
+      - $ref: '#/components/parameters/RecipeId'
+    get:
+      tags: [Recipes]
+      operationId: listRecipeVersions
+      summary: List versions (newest first)
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of versions
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecipeVersionPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/recipes/{recipeId}/versions/{versionNo}:
+    parameters:
+      - $ref: '#/components/parameters/RecipeId'
+      - name: versionNo
+        in: path
+        required: true
+        schema: { type: integer, minimum: 1 }
+    get:
+      tags: [Recipes]
+      operationId: getRecipeVersion
+      summary: Get one immutable version
+      responses:
+        '200':
+          description: Version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecipeVersion' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/recipes/{recipeId}/diff:
+    parameters:
+      - $ref: '#/components/parameters/RecipeId'
+    get:
+      tags: [Recipes]
+      operationId: diffRecipeVersions
+      summary: Diff two versions of a recipe
+      description: Free plan may diff adjacent versions only (|to - from| = 1). Other pairs return 402.
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1 }
+        - name: to
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Diff rows
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiffResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/EntitlementRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/recipes/{recipeId}/batches:
+    parameters:
+      - $ref: '#/components/parameters/RecipeId'
+    get:
+      tags: [Recipes]
+      operationId: listRecipeBatches
+      summary: Batches brewed from any version of this recipe (newest first)
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of batch summaries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BatchSummaryPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Compare
+  /v1/compare:
+    post:
+      tags: [Compare]
+      operationId: compareItems
+      summary: Compare 2..6 batches or bottles side by side
+      description: Free plan allows 2 items, Pro allows 6. Exceeding the plan limit returns 402 `entitlement_required`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompareRequest' }
+      responses:
+        '200':
+          description: Comparison
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompareResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/EntitlementRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ---------------------------------------------------------------- Measurement definitions
+  /v1/measurement-definitions:
+    get:
+      tags: [Measurements]
+      operationId: listMeasurementDefinitions
+      summary: System and own definitions (archived excluded unless requested)
+      parameters:
+        - name: includeArchived
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Definitions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/MeasurementDefinition' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Measurements]
+      operationId: createMeasurementDefinition
+      summary: Create a custom definition (free plan limit 3 active)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateMeasurementDefinitionRequest' }
+      responses:
+        '201':
+          description: Created definition
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeasurementDefinition' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/EntitlementRequired' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/measurement-definitions/{definitionId}:
+    parameters:
+      - name: definitionId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Measurements]
+      operationId: updateMeasurementDefinition
+      summary: Update label, decimals or range (key and unit are fixed once used)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateMeasurementDefinitionRequest' }
+      responses:
+        '200':
+          description: Updated definition
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeasurementDefinition' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      tags: [Measurements]
+      operationId: deleteMeasurementDefinition
+      summary: Delete an unused definition, or archive it when measurements reference it
+      responses:
+        '200':
+          description: Outcome
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeleteMeasurementDefinitionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Reminders
+  /v1/reminders:
+    get:
+      tags: [Reminders]
+      operationId: listReminders
+      summary: List reminders (ordered by dueAt ascending)
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/ReminderStatus' }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of reminders
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReminderPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Reminders]
+      operationId: createReminder
+      summary: Create a manual reminder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateReminderRequest' }
+      responses:
+        '201':
+          description: Created reminder
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reminder' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/reminders/{reminderId}:
+    parameters:
+      - name: reminderId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Reminders]
+      operationId: updateReminder
+      summary: Mark done, snooze, dismiss, or edit label/dueAt
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateReminderRequest' }
+      responses:
+        '200':
+          description: Updated reminder
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reminder' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/calendar:
+    get:
+      tags: [Reminders]
+      operationId: getCalendarFeed
+      summary: Private .ics feed URL
+      responses:
+        '200':
+          description: Feed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CalendarFeed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/calendar/rotate:
+    post:
+      tags: [Reminders]
+      operationId: rotateCalendarToken
+      summary: Invalidate the current feed URL and issue a new one
+      responses:
+        '200':
+          description: New feed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CalendarFeed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /calendar/{token}.ics:
+    get:
+      tags: [Public]
+      operationId: getCalendarIcs
+      summary: Public iCalendar feed (no auth, unguessable token)
+      description: Returns pending and snoozed reminders from now to +30 days. An unknown or rotated token returns 404.
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: { type: string, minLength: 32, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }
+      responses:
+        '200':
+          description: iCalendar document
+          content:
+            text/calendar:
+              schema: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ---------------------------------------------------------------- Exports
+  /v1/exports:
+    post:
+      tags: [Exports]
+      operationId: createExport
+      summary: Start a full data export (ZIP of CSV per table plus nested JSON)
+      responses:
+        '202':
+          description: Export queued
+          headers:
+            Location:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportCreated' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/exports/{exportId}:
+    parameters:
+      - name: exportId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Exports]
+      operationId: getExport
+      summary: Export status and, when ready, a short-lived signed download URL
+      responses:
+        '200':
+          description: Export job
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportJob' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Billing
+  /v1/entitlements:
+    get:
+      tags: [Billing]
+      operationId: getEntitlements
+      summary: Current plan and limits (poll after checkout)
+      responses:
+        '200':
+          description: Entitlements
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entitlements' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/billing/checkout:
+    post:
+      tags: [Billing]
+      operationId: createCheckout
+      summary: Create a Merchant-of-Record checkout for an allow-listed price
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CheckoutRequest' }
+      responses:
+        '200':
+          description: Checkout URL
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckoutResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/billing/portal:
+    get:
+      tags: [Billing]
+      operationId: getBillingPortal
+      summary: Customer portal URL at the billing provider
+      responses:
+        '200':
+          description: Portal URL
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PortalResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /webhooks/billing/{provider}:
+    post:
+      tags: [Webhooks]
+      operationId: receiveBillingWebhook
+      summary: Billing provider webhook (signature-verified, idempotent)
+      description: |
+        Authenticated by the provider's signature over the raw body, not by JWT.
+        The event is stored in `billing_events` keyed by (provider, providerEventId);
+        duplicates return 200 without reprocessing.
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [paddle, creem, polar]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Accepted (new or duplicate event)
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Signature missing or invalid (code `invalid_signature`)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token issued by the auth provider (default Supabase Auth), verified by the API via JWKS.
+
+  parameters:
+    BatchId:
+      name: batchId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    BottleId:
+      name: bottleId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RecipeId:
+      name: recipeId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from a previous page's `nextCursor`.
+      schema: { type: string, maxLength: 512 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    IdempotencyKeyRequired:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated unique key (UUID recommended). Stored 24 hours per user.
+      schema: { type: string, minLength: 8, maxLength: 128 }
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Optional. When present, a retried request returns the original response.
+      schema: { type: string, minLength: 8, maxLength: 128 }
+
+  responses:
+    BadRequest:
+      description: Malformed request, bad query parameter or invalid cursor
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing, expired or invalid token (code `unauthenticated`)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    EntitlementRequired:
+      description: Plan limit exceeded (code `entitlement_required`)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Action not allowed on a visible resource, e.g. editing a system definition (code `system_definition_readonly`)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Resource does not exist or belongs to another user (code `not_found`)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: State conflict, e.g. `invalid_state_transition`, `recipe_version_immutable`, `no_changes`, `idempotency_in_progress`
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationFailed:
+      description: Semantically invalid input (code `validation_failed`, `field_immutable` or `idempotency_key_reused`)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: Too many requests (code `rate_limited`)
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    # ------------------------------------------------------------ errors and paging
+    Problem:
+      type: object
+      description: RFC 9457 problem details with Jarlore extensions.
+      required: [type, title, status, code, requestId]
+      properties:
+        type: { type: string, format: uri-reference, examples: ['https://docs.jarlore.app/errors/entitlement_required'] }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code:
+          type: string
+          description: Stable machine-readable code.
+          examples: [recipe_version_immutable, entitlement_required, validation_failed, not_found]
+        errors:
+          type: array
+          items: { $ref: '#/components/schemas/ProblemFieldError' }
+        requestId: { type: string }
+    ProblemFieldError:
+      type: object
+      required: [field, code, message]
+      properties:
+        field: { type: string, description: 'JSON pointer-like path, e.g. ingredients[2].amount' }
+        code: { type: string, examples: [required, too_large, invalid_enum, method_required] }
+        message: { type: string }
+
+    # ------------------------------------------------------------ enums
+    FermentationTypeId:
+      type: string
+      enum: [kombucha, water_kefir, custom]
+    BatchStatus:
+      type: string
+      enum: [active, finished, discarded]
+    BatchStage:
+      type: string
+      enum: [f1, f2, done]
+    BottleStatus:
+      type: string
+      enum: [conditioning, chilled, finished, discarded]
+    IngredientRole:
+      type: string
+      enum: [water, tea, sugar, starter, flavor, other]
+    AdditionForm:
+      type: string
+      enum: [juice, puree, chunks, whole, syrup, dried, other]
+    LogKind:
+      type: string
+      enum: [note, taste, burp, measure, stage_change, feed, issue]
+    ReminderKind:
+      type: string
+      enum: [taste_check, bottle, burp, chill, custom]
+    ReminderStatus:
+      type: string
+      enum: [pending, done, snoozed, dismissed]
+    Plan:
+      type: string
+      enum: [free, pro]
+
+    # ------------------------------------------------------------ reference data
+    FermentationStage:
+      type: object
+      required: [key, label, typicalDays]
+      properties:
+        key: { type: string, enum: [f1, f2, ferment] }
+        label: { type: string }
+        typicalDays:
+          type: array
+          prefixItems:
+            - { type: integer, minimum: 0 }
+            - { type: integer, minimum: 0 }
+          minItems: 2
+          maxItems: 2
+          description: '[min, max] typical days. Reference only, never a verdict.'
+    FermentationType:
+      type: object
+      required: [id, name, stages]
+      properties:
+        id: { $ref: '#/components/schemas/FermentationTypeId' }
+        name: { type: string }
+        stages:
+          type: array
+          items: { $ref: '#/components/schemas/FermentationStage' }
+
+    # ------------------------------------------------------------ value objects
+    IngredientInput:
+      type: object
+      required: [name, role, amount, unit]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        role: { $ref: '#/components/schemas/IngredientRole' }
+        amount: { type: number, minimum: 0 }
+        unit: { type: string, minLength: 1, maxLength: 16, examples: [g, ml, l, tsp, bags] }
+    Ingredient:
+      allOf:
+        - $ref: '#/components/schemas/IngredientInput'
+        - type: object
+          required: [id]
+          properties:
+            id: { type: string, format: uuid }
+    Addition:
+      type: object
+      required: [name, form, amount, unit]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        form: { $ref: '#/components/schemas/AdditionForm' }
+        amount: { type: [number, 'null'], minimum: 0 }
+        unit: { type: [string, 'null'], maxLength: 16 }
+    Measurement:
+      type: object
+      required: [definitionKey, value, unit, method]
+      properties:
+        definitionKey: { type: string, pattern: '^[a-z0-9_]{2,40}$' }
+        value: { type: number }
+        unit: { type: string, maxLength: 16 }
+        method:
+          type: [string, 'null']
+          enum: [strip, meter, refractometer, hydrometer, thermometer, sensor, taste, estimate, other, null]
+          description: Required (non-null) for `ph`.
+    Rating:
+      type: object
+      required: [overall, fizz, sweetTart, flavor, offNotes, wouldRepeat, note]
+      properties:
+        overall: { type: integer, minimum: 1, maximum: 5 }
+        fizz: { type: [integer, 'null'], minimum: 1, maximum: 5 }
+        sweetTart: { type: [integer, 'null'], minimum: 1, maximum: 5, description: '1 = sweet, 5 = tart' }
+        flavor: { type: [integer, 'null'], minimum: 1, maximum: 5 }
+        offNotes:
+          type: array
+          maxItems: 20
+          items: { type: string, maxLength: 40 }
+        wouldRepeat: { type: [boolean, 'null'] }
+        note: { type: [string, 'null'], maxLength: 2000 }
+    BatchParams:
+      type: object
+      additionalProperties: false
+      properties:
+        targetF1Days: { type: number, minimum: 0, maximum: 365 }
+        roomTempC: { type: number, minimum: -10, maximum: 60 }
+        starterSource: { type: string, maxLength: 200 }
+    RecipeParams:
+      type: object
+      additionalProperties: false
+      description: Recipe-level parameters. Only targetF1Days is recipe-level in the MVP.
+      properties:
+        targetF1Days: { type: number, minimum: 0, maximum: 365 }
+        roomTempC: { type: number, minimum: -10, maximum: 60 }
+        starterSource: { type: string, maxLength: 200 }
+    RecipeVersionRef:
+      type: object
+      required: [recipeId, recipeName, versionId, versionNo]
+      properties:
+        recipeId: { type: string, format: uuid }
+        recipeName: { type: string }
+        versionId: { type: string, format: uuid }
+        versionNo: { type: integer, minimum: 1 }
+    CompareItemRef:
+      type: object
+      required: [type, id]
+      properties:
+        type: { type: string, enum: [batch, bottle] }
+        id: { type: string, format: uuid }
+    RecipeVersionItemRef:
+      type: object
+      required: [type, id]
+      properties:
+        type: { type: string, const: recipe_version }
+        id: { type: string, format: uuid }
+    DiffRow:
+      type: object
+      required: [key, label, group, values, unit, differs, direction]
+      properties:
+        key: { type: string, examples: ['ingredients.sugar.cane_sugar', 'params.targetF1Days'] }
+        label: { type: string }
+        group:
+          type: string
+          enum: [ingredients, params, additions, process, measurements, result]
+        values:
+          type: array
+          items: { type: [string, number, 'null'] }
+        unit: { type: [string, 'null'] }
+        differs: { type: boolean }
+        direction:
+          type: array
+          description: Same length as values. Index 0 (base) is always null. Others compare against values[0].
+          items:
+            type: [string, 'null']
+            enum: [up, down, same, null]
+    DiffResult:
+      type: object
+      required: [rows, changeCount]
+      properties:
+        rows:
+          type: array
+          items: { $ref: '#/components/schemas/DiffRow' }
+        changeCount: { type: integer, minimum: 0 }
+
+    # ------------------------------------------------------------ profile
+    Me:
+      type: object
+      required: [id, email, displayName, unitSystem, tempUnit, timezone, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: [string, 'null'], format: email }
+        displayName: { type: [string, 'null'] }
+        unitSystem: { type: string, enum: [metric, us] }
+        tempUnit: { type: string, enum: [C, F] }
+        timezone: { type: string, description: 'IANA zone', examples: [Asia/Jakarta] }
+        createdAt: { type: string, format: date-time }
+    UpdateMeRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        displayName: { type: [string, 'null'], maxLength: 80 }
+        unitSystem: { type: string, enum: [metric, us] }
+        tempUnit: { type: string, enum: [C, F] }
+        timezone: { type: string, maxLength: 64, description: 'Must be a valid IANA zone.' }
+    DeleteMeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        confirmationToken: { type: string, minLength: 16, maxLength: 256 }
+    DeleteMeResponse:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [confirmation_sent, scheduled] }
+        expiresAt: { type: [string, 'null'], format: date-time, description: 'Token expiry when confirmation_sent.' }
+        scheduledFor: { type: [string, 'null'], format: date-time, description: 'When deletion runs, when scheduled.' }
+
+    # ------------------------------------------------------------ log entries and bottles
+    LogEntry:
+      type: object
+      required: [id, batchId, bottleId, kind, occurredAt, note, measurements, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        batchId: { type: string, format: uuid }
+        bottleId: { type: [string, 'null'], format: uuid }
+        kind: { $ref: '#/components/schemas/LogKind' }
+        occurredAt: { type: string, format: date-time }
+        note: { type: [string, 'null'], maxLength: 4000 }
+        measurements:
+          type: array
+          items: { $ref: '#/components/schemas/Measurement' }
+        createdAt: { type: string, format: date-time }
+    CreateLogRequest:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [note, taste, burp, measure, feed, issue]
+        bottleId: { type: [string, 'null'], format: uuid }
+        bottleIds:
+          type: array
+          minItems: 1
+          maxItems: 50
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        occurredAt: { type: string, format: date-time, description: 'Defaults to server time. Must not be more than 5 minutes in the future.' }
+        note: { type: [string, 'null'], maxLength: 4000 }
+        measurements:
+          type: array
+          maxItems: 20
+          items: { $ref: '#/components/schemas/Measurement' }
+    CreateLogsResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/LogEntry' }
+    LogEntryPage:
+      type: object
+      required: [data, nextCursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/LogEntry' }
+        nextCursor: { type: [string, 'null'] }
+    Bottle:
+      type: object
+      required: [id, batchId, label, flavorName, volumeMl, additions, primingSugarG, headspaceCm, status, startedAt, finishedAt, lastMeasurements, rating]
+      properties:
+        id: { type: string, format: uuid }
+        batchId: { type: string, format: uuid }
+        label: { type: string, examples: [A] }
+        flavorName: { type: string }
+        volumeMl: { type: integer, minimum: 1 }
+        additions:
+          type: array
+          items: { $ref: '#/components/schemas/Addition' }
+        primingSugarG: { type: [number, 'null'], minimum: 0 }
+        headspaceCm: { type: [number, 'null'], minimum: 0 }
+        status: { $ref: '#/components/schemas/BottleStatus' }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+        lastMeasurements:
+          type: array
+          description: Latest value per definitionKey recorded against this bottle.
+          items: { $ref: '#/components/schemas/Measurement' }
+        rating:
+          oneOf:
+            - $ref: '#/components/schemas/Rating'
+            - type: 'null'
+    BottleInput:
+      type: object
+      additionalProperties: false
+      required: [label, flavorName, volumeMl, additions, primingSugarG, headspaceCm]
+      properties:
+        label: { type: string, minLength: 1, maxLength: 8 }
+        flavorName: { type: string, minLength: 1, maxLength: 80 }
+        volumeMl: { type: integer, minimum: 1, maximum: 20000 }
+        additions:
+          type: array
+          maxItems: 20
+          items: { $ref: '#/components/schemas/Addition' }
+        primingSugarG: { type: [number, 'null'], minimum: 0, maximum: 1000 }
+        headspaceCm: { type: [number, 'null'], minimum: 0, maximum: 50 }
+    CreateBottlesRequest:
+      type: object
+      additionalProperties: false
+      required: [bottles]
+      properties:
+        bottles:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { $ref: '#/components/schemas/BottleInput' }
+        bottledAt: { type: string, format: date-time, description: 'Defaults to now. Must be >= batch startedAt.' }
+    UpdateBottleRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        label: { type: string, minLength: 1, maxLength: 8 }
+        flavorName: { type: string, minLength: 1, maxLength: 80 }
+        volumeMl: { type: integer, minimum: 1, maximum: 20000 }
+        additions:
+          type: array
+          maxItems: 20
+          items: { $ref: '#/components/schemas/Addition' }
+        primingSugarG: { type: [number, 'null'], minimum: 0, maximum: 1000 }
+        headspaceCm: { type: [number, 'null'], minimum: 0, maximum: 50 }
+        status:
+          type: string
+          enum: [conditioning, chilled, discarded]
+          description: Use POST /v1/bottles/{id}/finish to finish. Allowed transitions are listed in DOMAIN_MODEL.md.
+    FinishBottleRequest:
+      type: object
+      additionalProperties: false
+      required: [rating]
+      properties:
+        rating: { $ref: '#/components/schemas/Rating' }
+        finishedAt: { type: string, format: date-time }
+
+    # ------------------------------------------------------------ reminders
+    Reminder:
+      type: object
+      required: [id, batchId, bottleId, kind, dueAt, status, label]
+      properties:
+        id: { type: string, format: uuid }
+        batchId: { type: string, format: uuid }
+        bottleId: { type: [string, 'null'], format: uuid }
+        kind: { $ref: '#/components/schemas/ReminderKind' }
+        dueAt: { type: string, format: date-time }
+        status: { $ref: '#/components/schemas/ReminderStatus' }
+        label: { type: string, examples: ['Burp KB-014 bottles', 'Taste check KB-014'] }
+    ReminderPage:
+      type: object
+      required: [data, nextCursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Reminder' }
+        nextCursor: { type: [string, 'null'] }
+    CreateReminderRequest:
+      type: object
+      additionalProperties: false
+      required: [batchId, kind, dueAt, label]
+      properties:
+        batchId: { type: string, format: uuid }
+        bottleId: { type: [string, 'null'], format: uuid }
+        kind: { $ref: '#/components/schemas/ReminderKind' }
+        dueAt: { type: string, format: date-time }
+        label: { type: string, minLength: 1, maxLength: 120 }
+    UpdateReminderRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        status:
+          type: string
+          enum: [done, snoozed, dismissed]
+        snoozeUntil: { type: string, format: date-time, description: 'Required when status is snoozed. Becomes the new dueAt.' }
+        dueAt: { type: string, format: date-time }
+        label: { type: string, minLength: 1, maxLength: 120 }
+    CalendarFeed:
+      type: object
+      required: [feedUrl, rotatedAt]
+      properties:
+        feedUrl: { type: string, format: uri }
+        rotatedAt: { type: [string, 'null'], format: date-time }
+
+    # ------------------------------------------------------------ batches
+    BatchSummary:
+      type: object
+      required: [id, code, name, fermentationTypeId, status, stage, archivedAt, startedAt, finishedAt, volumeMl, vessel, recipeVersion, parentBatchId, hypothesis, isReference, rating, bottleCount, lastLog, nextReminder]
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, examples: [KB-014] }
+        name: { type: string }
+        fermentationTypeId: { $ref: '#/components/schemas/FermentationTypeId' }
+        status: { $ref: '#/components/schemas/BatchStatus' }
+        stage: { $ref: '#/components/schemas/BatchStage' }
+        archivedAt: { type: [string, 'null'], format: date-time }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+        volumeMl: { type: integer }
+        vessel: { type: [string, 'null'] }
+        recipeVersion:
+          oneOf:
+            - $ref: '#/components/schemas/RecipeVersionRef'
+            - type: 'null'
+        parentBatchId: { type: [string, 'null'], format: uuid }
+        hypothesis: { type: [string, 'null'] }
+        isReference: { type: boolean }
+        rating:
+          oneOf:
+            - $ref: '#/components/schemas/Rating'
+            - type: 'null'
+        bottleCount: { type: integer, minimum: 0 }
+        lastLog:
+          oneOf:
+            - $ref: '#/components/schemas/LogEntry'
+            - type: 'null'
+        nextReminder:
+          oneOf:
+            - $ref: '#/components/schemas/Reminder'
+            - type: 'null'
+    BatchSummaryPage:
+      type: object
+      required: [data, nextCursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/BatchSummary' }
+        nextCursor: { type: [string, 'null'] }
+    Batch:
+      type: object
+      required: [id, code, name, fermentationTypeId, status, stage, archivedAt, startedAt, finishedAt, volumeMl, vessel, recipeVersion, ingredients, params, parentBatchId, hypothesis, isReference, rating, bottles, lastLog, nextReminder]
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, examples: [KB-014] }
+        name: { type: string }
+        fermentationTypeId: { $ref: '#/components/schemas/FermentationTypeId' }
+        status: { $ref: '#/components/schemas/BatchStatus' }
+        stage: { $ref: '#/components/schemas/BatchStage' }
+        archivedAt: { type: [string, 'null'], format: date-time }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+        volumeMl: { type: integer }
+        vessel: { type: [string, 'null'] }
+        recipeVersion:
+          oneOf:
+            - $ref: '#/components/schemas/RecipeVersionRef'
+            - type: 'null'
+        ingredients:
+          type: array
+          items: { $ref: '#/components/schemas/Ingredient' }
+        params: { $ref: '#/components/schemas/BatchParams' }
+        parentBatchId: { type: [string, 'null'], format: uuid }
+        hypothesis: { type: [string, 'null'] }
+        isReference: { type: boolean }
+        rating:
+          oneOf:
+            - $ref: '#/components/schemas/Rating'
+            - type: 'null'
+        bottles:
+          type: array
+          items: { $ref: '#/components/schemas/Bottle' }
+        lastLog:
+          oneOf:
+            - $ref: '#/components/schemas/LogEntry'
+            - type: 'null'
+        nextReminder:
+          oneOf:
+            - $ref: '#/components/schemas/Reminder'
+            - type: 'null'
+    BatchSource:
+      oneOf:
+        - $ref: '#/components/schemas/RecipeVersionItemRef'
+        - type: object
+          required: [type, id]
+          properties:
+            type: { type: string, const: batch }
+            id: { type: string, format: uuid }
+    CreateBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [fermentationTypeId, volumeMl, ingredients, params]
+      properties:
+        fermentationTypeId: { $ref: '#/components/schemas/FermentationTypeId' }
+        name: { type: string, minLength: 1, maxLength: 120, description: 'Defaults to the generated code.' }
+        startedAt: { type: string, format: date-time, description: 'Defaults to now. May be in the past (backdating).' }
+        volumeMl: { type: integer, minimum: 1, maximum: 200000 }
+        vessel: { type: [string, 'null'], maxLength: 80 }
+        ingredients:
+          type: array
+          maxItems: 30
+          items: { $ref: '#/components/schemas/IngredientInput' }
+        params: { $ref: '#/components/schemas/BatchParams' }
+        source: { $ref: '#/components/schemas/BatchSource' }
+        hypothesis: { type: [string, 'null'], maxLength: 1000 }
+    UpdateBatchRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        vessel: { type: [string, 'null'], maxLength: 80 }
+        isReference: { type: boolean }
+        params:
+          type: object
+          additionalProperties: false
+          properties:
+            roomTempC: { type: [number, 'null'], minimum: -10, maximum: 60 }
+    BatchSnapshot:
+      type: object
+      required: [batchId, capturedAt, recipeVersion, ingredients, params, defaultBottles, deviations]
+      properties:
+        batchId: { type: string, format: uuid }
+        capturedAt: { type: string, format: date-time }
+        recipeVersion: { $ref: '#/components/schemas/RecipeVersionRef' }
+        ingredients:
+          type: array
+          items: { $ref: '#/components/schemas/Ingredient' }
+        params: { $ref: '#/components/schemas/RecipeParams' }
+        defaultBottles:
+          type: array
+          items: { $ref: '#/components/schemas/DefaultBottle' }
+        deviations:
+          type: array
+          description: Derived diff (snapshot vs batch actuals). Batch-level only, by construction.
+          items: { $ref: '#/components/schemas/DiffRow' }
+    BrewAgainResponse:
+      type: object
+      required: [draft, base, recipeVersion]
+      properties:
+        draft: { $ref: '#/components/schemas/CreateBatchRequest' }
+        base:
+          type: object
+          required: [ref, title]
+          properties:
+            ref: { $ref: '#/components/schemas/CompareItemRef' }
+            title: { type: string, examples: ['KB-014 Ginger fizz'] }
+        recipeVersion:
+          oneOf:
+            - $ref: '#/components/schemas/RecipeVersionRef'
+            - type: 'null'
+    DiffPreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [base, draft]
+      properties:
+        base:
+          oneOf:
+            - $ref: '#/components/schemas/CompareItemRef'
+            - $ref: '#/components/schemas/RecipeVersionItemRef'
+        draft: { $ref: '#/components/schemas/CreateBatchRequest' }
+    FinishBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [rating]
+      properties:
+        rating: { $ref: '#/components/schemas/Rating' }
+        finishedAt: { type: string, format: date-time, description: 'Defaults to now. Must be >= startedAt.' }
+    DiscardBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason: { type: string, minLength: 1, maxLength: 500 }
+    SaveAsRecipeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120, description: 'Required when recipeId is absent.' }
+        changeNote: { type: [string, 'null'], maxLength: 1000 }
+        recipeId: { type: string, format: uuid, description: 'When present, creates version n+1 of this recipe.' }
+    ReferenceResponse:
+      type: object
+      required: [batch, reason]
+      properties:
+        batch:
+          oneOf:
+            - $ref: '#/components/schemas/BatchSummary'
+            - type: 'null'
+        reason:
+          type: [string, 'null']
+          enum: [marked_reference_same_recipe, last_good_same_recipe, marked_reference_same_type, last_good_same_type, null]
+
+    # ------------------------------------------------------------ recipes
+    DefaultBottle:
+      type: object
+      required: [flavorName, additions, primingSugarG]
+      properties:
+        flavorName: { type: string }
+        additions:
+          type: array
+          items: { $ref: '#/components/schemas/Addition' }
+        primingSugarG: { type: [number, 'null'], minimum: 0 }
+    RecipeVersion:
+      type: object
+      description: Immutable. There is no update or delete operation.
+      required: [id, recipeId, versionNo, parentVersionId, changeNote, sourceBatchId, ingredients, params, defaultBottles, createdAt, batchCount, avgOverall]
+      properties:
+        id: { type: string, format: uuid }
+        recipeId: { type: string, format: uuid }
+        versionNo: { type: integer, minimum: 1 }
+        parentVersionId: { type: [string, 'null'], format: uuid }
+        changeNote: { type: [string, 'null'] }
+        sourceBatchId: { type: [string, 'null'], format: uuid }
+        ingredients:
+          type: array
+          items: { $ref: '#/components/schemas/Ingredient' }
+        params: { $ref: '#/components/schemas/RecipeParams' }
+        defaultBottles:
+          type: array
+          items: { $ref: '#/components/schemas/DefaultBottle' }
+        createdAt: { type: string, format: date-time }
+        batchCount: { type: integer, minimum: 0 }
+        avgOverall: { type: [number, 'null'] }
+    RecipeVersionPage:
+      type: object
+      required: [data, nextCursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/RecipeVersion' }
+        nextCursor: { type: [string, 'null'] }
+    Recipe:
+      type: object
+      required: [id, name, fermentationTypeId, latestVersion, versionCount, batchCount, avgOverall, archivedAt, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        fermentationTypeId: { $ref: '#/components/schemas/FermentationTypeId' }
+        latestVersion: { $ref: '#/components/schemas/RecipeVersion' }
+        versionCount: { type: integer, minimum: 1 }
+        batchCount: { type: integer, minimum: 0 }
+        avgOverall: { type: [number, 'null'] }
+        archivedAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+    RecipePage:
+      type: object
+      required: [data, nextCursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Recipe' }
+        nextCursor: { type: [string, 'null'] }
+    UpdateRecipeRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        archived: { type: boolean }
+
+    # ------------------------------------------------------------ compare
+    CompareRequest:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 2
+          maxItems: 6
+          items: { $ref: '#/components/schemas/CompareItemRef' }
+        onlyDifferences: { type: boolean, default: false }
+    CompareResult:
+      type: object
+      required: [items, rows]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [ref, title, subtitle, isReference]
+            properties:
+              ref: { $ref: '#/components/schemas/CompareItemRef' }
+              title: { type: string }
+              subtitle: { type: [string, 'null'] }
+              isReference: { type: boolean }
+        rows:
+          type: array
+          items: { $ref: '#/components/schemas/DiffRow' }
+
+    # ------------------------------------------------------------ measurement definitions
+    MeasurementDefinition:
+      type: object
+      required: [id, key, label, unit, decimals, min, max, isSystem]
+      properties:
+        id: { type: string, format: uuid }
+        key: { type: string, pattern: '^[a-z0-9_]{2,40}$' }
+        label: { type: string }
+        unit: { type: string, description: 'Canonical unit, e.g. pH, C, brix, sg, or a user-defined unit.' }
+        decimals: { type: integer, minimum: 0, maximum: 4 }
+        min: { type: [number, 'null'] }
+        max: { type: [number, 'null'] }
+        isSystem: { type: boolean }
+    CreateMeasurementDefinitionRequest:
+      type: object
+      additionalProperties: false
+      required: [key, label, unit, decimals]
+      properties:
+        key: { type: string, pattern: '^[a-z0-9_]{2,40}$' }
+        label: { type: string, minLength: 1, maxLength: 60 }
+        unit: { type: string, minLength: 1, maxLength: 16 }
+        decimals: { type: integer, minimum: 0, maximum: 4 }
+        min: { type: [number, 'null'] }
+        max: { type: [number, 'null'] }
+    UpdateMeasurementDefinitionRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        label: { type: string, minLength: 1, maxLength: 60 }
+        unit: { type: string, minLength: 1, maxLength: 16, description: 'Only while unused.' }
+        decimals: { type: integer, minimum: 0, maximum: 4 }
+        min: { type: [number, 'null'] }
+        max: { type: [number, 'null'] }
+    DeleteMeasurementDefinitionResponse:
+      type: object
+      required: [id, outcome]
+      properties:
+        id: { type: string, format: uuid }
+        outcome: { type: string, enum: [deleted, archived] }
+
+    # ------------------------------------------------------------ today
+    TodayResponse:
+      type: object
+      required: [active, due, recentlyFinished]
+      properties:
+        active:
+          type: array
+          items: { $ref: '#/components/schemas/BatchSummary' }
+        due:
+          type: array
+          items: { $ref: '#/components/schemas/Reminder' }
+        recentlyFinished:
+          type: array
+          items: { $ref: '#/components/schemas/BatchSummary' }
+
+    # ------------------------------------------------------------ exports
+    ExportCreated:
+      type: object
+      required: [id, status]
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [queued, running, ready, failed, expired] }
+    ExportJob:
+      type: object
+      required: [id, status, createdAt, completedAt, expiresAt, downloadUrl]
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [queued, running, ready, failed, expired] }
+        createdAt: { type: string, format: date-time }
+        completedAt: { type: [string, 'null'], format: date-time }
+        expiresAt: { type: [string, 'null'], format: date-time, description: 'When the file is deleted.' }
+        downloadUrl: { type: [string, 'null'], format: uri, description: 'Signed URL valid 15 minutes, freshly issued on each GET while ready.' }
+
+    # ------------------------------------------------------------ billing
+    Entitlements:
+      type: object
+      required: [plan, limits, source]
+      properties:
+        plan: { $ref: '#/components/schemas/Plan' }
+        limits:
+          type: object
+          required: [compareItems, customMeasurements]
+          properties:
+            compareItems: { type: integer, minimum: 2, maximum: 6 }
+            customMeasurements: { type: [integer, 'null'], minimum: 0, description: 'null means unlimited.' }
+        source:
+          type: string
+          enum: [default, subscription, beta, grant]
+          description: Why the user has this plan.
+    CheckoutRequest:
+      type: object
+      additionalProperties: false
+      required: [priceId]
+      properties:
+        priceId: { type: string, maxLength: 128, description: 'Must be in the server-side allow-list.' }
+    CheckoutResponse:
+      type: object
+      required: [checkoutUrl]
+      properties:
+        checkoutUrl: { type: string, format: uri }
+    PortalResponse:
+      type: object
+      required: [portalUrl]
+      properties:
+        portalUrl: { type: string, format: uri }

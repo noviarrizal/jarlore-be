@@ -1,0 +1,45 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# Editors and IDEs
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+
+# Logs and temp
+*.log
+logs/
+tmp/
+.tmp/
+
+# Common build and dependency output (stack not chosen yet)
+node_modules/
+dist/
+build/
+out/
+coverage/
+.turbo/
+bin/
+vendor/
+__pycache__/
+*.pyc
+
+# Local data
+*.sqlite
+*.db
+exports/
