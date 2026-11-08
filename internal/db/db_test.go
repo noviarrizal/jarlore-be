@@ -57,7 +57,7 @@ func seed(t *testing.T) fixture {
 	draft := app.CreateBatchInput{FermentationTypeID: "kombucha", VolumeMl: 4000, Params: domain.BatchParams{},
 		Ingredients: []domain.IngredientInput{{Name: "Cane sugar", Role: "sugar", Amount: 200, Unit: "g"}}}
 	for _, u := range []auth.User{alice, bob} {
-		if err := svc.EnsureProfile(ctx, u); err != nil {
+		if err := svc.EnsureProfile(ctx, u, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

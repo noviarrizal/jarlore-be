@@ -46,8 +46,8 @@ func NewPool(ctx context.Context, url string, o PoolOptions) (*pgxpool.Pool, err
 		// (max_prepared_statements), so pgx's default statement cache works.
 		cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheStatement
 	}
-	// No connection is opened here: startup stays fast and the readiness probe
-	// is the first thing to touch the database.
+	// No connection is opened here; cmd/api opens the first one for the role
+	// guard (GuardRuntimeRole) before it starts listening.
 	return pgxpool.NewWithConfig(ctx, cfg)
 }
 

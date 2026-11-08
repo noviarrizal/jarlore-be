@@ -202,3 +202,4 @@ Behaviour worth knowing:
 - **Compare limits:** free plan 2 items, Pro 6, except that the bottles of one batch can always be compared together.
 - **Errors:** a malformed path id answers 404 like another user's id. Unknown body fields answer 422 `validation_failed`. Database failures never leak; an unreachable or resuming database answers 503 `unavailable`.
 - **Rate limits** (section 9) are not implemented yet.
+- **`Jarlore-Timezone` request header** (optional, IANA name): used only when the API creates the user's profile on the first authenticated request; invalid values fall back to `UTC`. Change the zone later with `PATCH /v1/me` (validated, `422 validation_failed` for unknown zones).

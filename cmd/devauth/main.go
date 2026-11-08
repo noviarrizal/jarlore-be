@@ -3,8 +3,9 @@
 // Auth's (iss = aud = issuer origin, role "authenticated") and serves the
 // matching JWKS, so the API runs its real verification path locally.
 //
-// It binds to 127.0.0.1 only and must never be deployed. Production uses Neon
-// Auth's JWKS (AUTH_JWKS_URL); the API never holds a signing key.
+// It refuses to start on a non-loopback address or with APP_ENV=production, is
+// not built into the container image, and must never be deployed. Production uses
+// Neon Auth's JWKS (AUTH_JWKS_URL); the API never holds a signing key.
 //
 //	go run ./cmd/devauth                  # http://127.0.0.1:9999
 //	curl -s -X POST 127.0.0.1:9999/token -d '{"user":"demo"}'
@@ -22,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -43,6 +45,9 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:9999", "listen address (loopback only)")
 	keyPath := flag.String("key", filepath.Join(os.TempDir(), "jarlore-devauth-ed25519.pem"), "signing key file (created if missing)")
 	flag.Parse()
+	if err := checkLocalOnly(*addr, os.Getenv("APP_ENV")); err != nil {
+		log.Fatal(err)
+	}
 
 	key, err := loadOrCreateKey(*keyPath)
 	if err != nil {
@@ -93,6 +98,22 @@ func main() {
 	log.Printf("devauth: issuer %s (development only)", issuer)
 	log.Printf("devauth: AUTH_JWKS_URL=%s/.well-known/jwks.json AUTH_ISSUER=%s", issuer, issuer)
 	log.Fatal(http.ListenAndServe(*addr, mux))
+}
+
+// checkLocalOnly keeps the issuer on this machine: anyone who can reach it can
+// mint a token for any user.
+func checkLocalOnly(addr, appEnv string) error {
+	if appEnv == "production" {
+		return errors.New("devauth: refusing to run with APP_ENV=production")
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("devauth: bad -addr %q: %w", addr, err)
+	}
+	if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		return fmt.Errorf("devauth: refusing to listen on %q; use a loopback address such as 127.0.0.1", host)
+	}
+	return nil
 }
 
 func loadOrCreateKey(path string) (ed25519.PrivateKey, error) {

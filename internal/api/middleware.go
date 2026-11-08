@@ -133,8 +133,12 @@ func timeout(d time.Duration) func(http.Handler) http.Handler {
 
 // ProfileEnsurer creates the user's profile on first contact.
 type ProfileEnsurer interface {
-	EnsureProfile(ctx context.Context, u auth.User) error
+	EnsureProfile(ctx context.Context, u auth.User, tzHint string) error
 }
+
+// TimezoneHintHeader carries the browser's IANA time zone. The frontend server
+// sends it on every request; the API uses it only when it creates the profile.
+const TimezoneHintHeader = "Jarlore-Timezone"
 
 // authenticate verifies the bearer token and puts the user in the context.
 func authenticate(v *auth.Verifier, p ProfileEnsurer) func(http.Handler) http.Handler {
@@ -153,7 +157,7 @@ func authenticate(v *auth.Verifier, p ProfileEnsurer) func(http.Handler) http.Ha
 				httpx.Error(w, r, apperr.Unauthenticated("The access token is invalid or expired. Sign in again."))
 				return
 			}
-			if err := p.EnsureProfile(r.Context(), u); err != nil {
+			if err := p.EnsureProfile(r.Context(), u, strings.TrimSpace(r.Header.Get(TimezoneHintHeader))); err != nil {
 				httpx.Error(w, r, err)
 				return
 			}

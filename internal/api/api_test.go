@@ -412,3 +412,26 @@ func TestWorkflowOverHTTP(t *testing.T) {
 		t.Errorf("Bob sees %d batches", len(bobList.Data))
 	}
 }
+
+// The frontend server sends the browser's time zone; the profile is created in it,
+// and later requests with another zone do not change it.
+func TestTimezoneHintCreatesProfileInUserZone(t *testing.T) {
+	e := newEnv(t)
+	const carolID = "33333333-3333-4333-8333-333333333333"
+	tok := e.token(carolID, nil)
+	var me app.Me
+	r := e.do("GET", "/v1/me", tok, nil, api.TimezoneHintHeader, "Asia/Jakarta")
+	e.expect(r, 200, "Me")
+	r.decode(t, &me)
+	if me.Timezone != "Asia/Jakarta" {
+		t.Fatalf("profile created in %q, want Asia/Jakarta", me.Timezone)
+	}
+	r = e.do("PATCH", "/v1/me", tok, map[string]any{"timezone": "Not/AZone"})
+	e.problem(r, 422, "validation_failed")
+	r = e.do("PATCH", "/v1/me", tok, map[string]any{"timezone": "America/New_York"})
+	e.expect(r, 200, "Me")
+	r.decode(t, &me)
+	if me.Timezone != "America/New_York" {
+		t.Fatalf("PATCH timezone = %q", me.Timezone)
+	}
+}

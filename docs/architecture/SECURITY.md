@@ -24,7 +24,9 @@ Implemented in `internal/auth` and `internal/api/middleware.go`. Tests in `inter
   - `sub` is a UUID; `role` is `authenticated`; `banned` users are rejected.
 - The API never holds a token-minting secret. The `neon_auth` schema (users, sessions) lives in the same database, but the API role has no grant on it.
 - No API sessions or cookies. CORS allows `FRONTEND_ORIGIN` only, methods used by the contract, headers `Authorization, Content-Type, Idempotency-Key`.
-- Profile is created lazily on the first valid request (`INSERT ... ON CONFLICT DO NOTHING`).
+- Profile is created lazily on the first valid request (`INSERT ... ON CONFLICT DO NOTHING`), in the time zone of the optional `Jarlore-Timezone` header when it is a valid IANA name (else UTC); the header never changes an existing profile.
+- The frontend keeps the JWT in an httpOnly cookie, minted and refreshed server-side by its proxy (jarlore-fe FRONTEND_ARCHITECTURE.md, "Authentication"); no token is readable by page scripts (Playwright `auth.spec.ts`).
+- `cmd/devauth`, the local test issuer, refuses `APP_ENV=production` and non-loopback addresses, and is not in the container image. The frontend accepts development sign-in only outside production builds and only from a loopback issuer.
 - Internal endpoints (`/internal/jobs/tick`) require `Authorization: Bearer <CRON_SECRET>` compared in constant time, and are not exposed in the public OpenAPI.
 
 ## 3. Authorization
@@ -48,8 +50,9 @@ Implemented in `internal/auth` and `internal/api/middleware.go`. Tests in `inter
 1. **Composite foreign keys** `(parent_id, user_id)` on every child table [Blueprint]. Even a buggy query cannot attach a log to another user's batch.
 2. **Denormalized `user_id`** on every child row with an index leading on `user_id` [Blueprint].
 3. **Row level security (implemented, see [DATABASE_DESIGN.md](DATABASE_DESIGN.md) §6; the setting is named `jarlore.user_id`, read by `jarlore_user_id()`).** Original design: The API connects as a non-owner role without `BYPASSRLS`. Each request transaction runs `SELECT set_config('app.user_id', :sub, true)`, and policies check `user_id = current_setting('app.user_id')::uuid`. Jobs that span users (reminders, webhooks, deletion) use a separate role with `BYPASSRLS`. Trade-off: one more moving part and every query must run inside a transaction, which works with transaction-mode poolers. Recommended before public launch, not required for the first build.
-4. **Immutability triggers** on `recipe_versions`, `recipe_ingredients` and the batch snapshot [Blueprint], as a second line behind the API.
-5. Object storage paths are prefixed `{user_id}/`; the bucket is private; downloads only through short-lived signed URLs.
+4. **Runtime role guard** (`internal/db/guard.go`, run by `cmd/api` before it listens): the API refuses to start if its role is a superuser, has `BYPASSRLS`, can `SET ROLE` to such a role, or owns (or has the privileges of the owner of) any RLS-protected table, because PostgreSQL skips non-forced policies for those. Tested against each case (`TestRuntimeRoleGuard`) and verified on Neon: `neondb_owner` is refused, `jarlore_api` passes. Errors never include connection details.
+5. **Immutability triggers** on `recipe_versions`, `recipe_ingredients` and the batch snapshot [Blueprint], as a second line behind the API.
+6. Object storage paths are prefixed `{user_id}/`; the bucket is private; downloads only through short-lived signed URLs.
 
 ## 6. Rate limits and abuse
 
@@ -109,11 +112,14 @@ From blueprint §16. The API is a record-keeping tool.
 - User-created templates or measurements can never be labelled "validated".
 
 
-## 12. Implementation status (2026-11-07)
+## 12. Implementation status (2026-11-08)
 
 | Control | Status |
 |---|---|
-| JWT verification via JWKS (ES256, RS256, EdDSA only): signature, issuer, audience, expiry, subject | Done |
+| JWT verification via JWKS (EdDSA only, Neon Auth): signature, issuer, audience, expiry, subject, role, banned | Done; a real Neon Auth token is checked by hand on the `dev` branch (P0_HARDENING_REPORT.md) |
+| Startup guard against an owner/superuser/BYPASSRLS runtime role | Done (tested locally and on Neon) |
+| Test issuer locked to loopback and non-production | Done |
+| Frontend security headers (CSP, HSTS, frame, nosniff, referrer, permissions) and error boundaries | Done (jarlore-fe) |
 | Ownership in every query; 404 for other users' ids and for malformed ids | Done |
 | Composite foreign keys, immutability triggers, RLS, restricted runtime role (`jarlore_app`) | Done |
 | Strict request decoding (unknown fields 422, 64 KB limit) and validation independent of the frontend | Done |

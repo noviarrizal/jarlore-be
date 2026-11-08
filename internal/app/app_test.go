@@ -33,7 +33,7 @@ func setup(t *testing.T) (*app.Service, *clock, context.Context, *testdb.DB) {
 	svc := app.New(d.Store, app.Options{CursorSecret: []byte("test-secret"), Now: c.now})
 	ctx := context.Background()
 	for _, u := range []auth.User{alice, bob} {
-		if err := svc.EnsureProfile(ctx, u); err != nil {
+		if err := svc.EnsureProfile(ctx, u, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

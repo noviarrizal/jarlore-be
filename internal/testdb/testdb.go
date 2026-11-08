@@ -38,6 +38,7 @@ const (
 
 type DB struct {
 	Name  string
+	admin string        // JARLORE_TEST_DATABASE_URL, for URLAs
 	Owner *pgxpool.Pool // migration/owner role: bypasses nothing, but owns the tables
 	App   *pgxpool.Pool // runtime role: subject to RLS and grants
 	Store *db.Store
@@ -116,7 +117,42 @@ func New(t testing.TB) *DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(app.Close)
-	return &DB{Name: name, Owner: owner, App: app, Store: &db.Store{Pool: app}}
+	return &DB{Name: name, admin: admin, Owner: owner, App: app, Store: &db.Store{Pool: app}}
+}
+
+// Password is the password of every role testdb creates (test-only).
+const Password = password
+
+// OwnerRole and APIRole are the migration owner and runtime roles testdb creates.
+const (
+	OwnerRole = ownerRole
+	APIRole   = apiRole
+)
+
+// Admin returns a connection to the server as the JARLORE_TEST_DATABASE_URL role.
+func (d *DB) Admin(t testing.TB) *pgx.Conn {
+	t.Helper()
+	c, err := pgx.Connect(context.Background(), d.admin)
+	if err != nil {
+		t.Fatalf("testdb: connect admin: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	return c
+}
+
+// URLAs returns a URL for this test database as user (with Password); an empty
+// user keeps the JARLORE_TEST_DATABASE_URL role.
+func (d *DB) URLAs(t testing.TB, user string) string {
+	t.Helper()
+	if user == "" {
+		u, err := url.Parse(d.admin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u.Path = "/" + d.Name
+		return u.String()
+	}
+	return withUser(t, d.admin, user, d.Name)
 }
 
 func withUser(t testing.TB, base, user, dbname string) string {

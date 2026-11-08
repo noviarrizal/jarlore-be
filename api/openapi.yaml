@@ -14,6 +14,10 @@ info:
     - JSON fields are camelCase. IDs are opaque strings (UUIDs). Timestamps are ISO 8601 UTC.
     - Errors use RFC 9457 `application/problem+json` (schema `Problem`).
     - Another user's resource is reported as 404, never 403.
+    - Optional request header `Jarlore-Timezone` (an IANA name such as `Asia/Jakarta`)
+      carries the browser's time zone. It is used only when the API creates the user's
+      profile on the first authenticated request (invalid values fall back to `UTC`);
+      change the zone later with `PATCH /v1/me`.
     - The API never labels a ferment "safe", "ready" or "passed".
   license:
     name: Proprietary

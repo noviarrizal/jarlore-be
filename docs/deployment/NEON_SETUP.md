@@ -67,6 +67,9 @@ Free plan: up to 60,000 monthly active users per project. Neon Auth is offered o
 
 ## 6. Branches for development and tests
 
+The environment rules (which branch for what, how `dev` is created, and the production data inventory) are in [ENVIRONMENT_STRATEGY.md](ENVIRONMENT_STRATEGY.md). Automated tests never use Neon.
+
+
 - Create a `dev` branch from `main` for local work: same schema, separate data, separate compute (counts toward the project's CU-hours).
 - Integration tests need a server where the connecting role can create roles and databases (`JARLORE_TEST_DATABASE_URL`). A throwaway branch's `neondb_owner` works; each test package creates and drops its own database. Local PostgreSQL is cheaper and faster for day-to-day runs.
 

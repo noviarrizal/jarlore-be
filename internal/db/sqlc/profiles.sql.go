@@ -36,21 +36,24 @@ func (q *Queries) DeleteExpiredIdempotencyKey(ctx context.Context, arg DeleteExp
 }
 
 const ensureProfile = `-- name: EnsureProfile :one
-INSERT INTO profiles (id, email)
-VALUES ($1, $2)
+INSERT INTO profiles (id, email, timezone)
+VALUES ($1, $2, coalesce($3::text, 'UTC'))
 ON CONFLICT (id) DO UPDATE SET email = excluded.email, updated_at = now()
   WHERE profiles.email IS DISTINCT FROM excluded.email
 RETURNING id, email, display_name, unit_system, temp_unit, timezone, created_at, updated_at
 `
 
 type EnsureProfileParams struct {
-	ID    string
-	Email *string
+	ID       string
+	Email    *string
+	Timezone *string
 }
 
 // Creates the profile on the first authenticated request and re-syncs the email claim.
+// The time zone (the browser's, validated by the API) is used only when the row is
+// created; later changes go through PATCH /v1/me.
 func (q *Queries) EnsureProfile(ctx context.Context, arg EnsureProfileParams) (Profile, error) {
-	row := q.db.QueryRow(ctx, ensureProfile, arg.ID, arg.Email)
+	row := q.db.QueryRow(ctx, ensureProfile, arg.ID, arg.Email, arg.Timezone)
 	var i Profile
 	err := row.Scan(
 		&i.ID,

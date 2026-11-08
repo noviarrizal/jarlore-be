@@ -38,7 +38,7 @@ func (s *Service) UpdateMe(ctx context.Context, u auth.User, in UpdateMeInput) (
 		f.Add("tempUnit", "invalid_enum", "tempUnit is C or F.")
 	}
 	if in.Timezone != nil {
-		if _, err := time.LoadLocation(*in.Timezone); err != nil || *in.Timezone == "" || strings.EqualFold(*in.Timezone, "local") {
+		if !ValidTimezone(*in.Timezone) {
 			f.Add("timezone", "invalid", "Use an IANA time zone such as Asia/Jakarta.")
 		}
 	}

@@ -14,7 +14,8 @@ psql -U postgres -f scripts/local-db.sql
 DIRECT_DATABASE_URL='postgres://jarlore_owner:jarlore_owner_local@localhost:5432/jarlore?sslmode=disable' go run ./cmd/migrate up
 psql -U postgres -d jarlore -c 'GRANT jarlore_app TO jarlore_api'
 
-# 2. Local token issuer (development only; stands in for Neon Auth)
+# 2. Local token issuer (development and tests only; stands in for Neon Auth;
+#    refuses non-loopback addresses and APP_ENV=production)
 go run ./cmd/devauth                     # http://127.0.0.1:9999
 
 # 3. The API
@@ -38,6 +39,8 @@ JARLORE_TEST_DATABASE_URL='postgres://postgres@localhost:5432/postgres?sslmode=d
 JARLORE_TEST_EXEC_MODE=exec go test ./...  # same, with pgx's pooler fallback mode
 ```
 
+CI (`.github/workflows/ci.yml`) runs all of the above on PostgreSQL 18 plus gofmt, vet, staticcheck, the race detector, `sqlc diff`, migrations applied twice, Redocly, and a container job that builds the image, checks it runs as non-root without secrets, refuses the owner role and shuts down gracefully. CI never touches Neon.
+
 Database tests create a fresh database per package with the same roles as production (non-superuser owner, restricted API role) and drop it afterwards. Without `JARLORE_TEST_DATABASE_URL` they are skipped, not faked. What they cover: the end-to-end acceptance scenario, the version rule, concurrent version numbering, idempotency, measurement kinds and units, user isolation, RLS, triggers, composite keys, grants, JWT verification and response conformance to `api/openapi.yaml`.
 
 ## Changing things
@@ -48,6 +51,10 @@ Database tests create a fresh database per package with the same roles as produc
 | Queries | Edit `db/queries/*.sql`, then `sqlc generate` (sqlc v1.31+; generated code is committed) |
 | Contract | Edit `api/openapi.yaml`, update `internal/app` types, run the tests, then `pnpm gen:api` in jarlore-fe |
 | Rules | `internal/domain` (pure, unit-tested) or `internal/app` (use cases) — never in handlers |
+
+## Environments
+
+`.env` is for development (local PostgreSQL or the Neon `dev` branch); production credentials live in Secret Manager and, for running migrations, in a separate `.env.production`. The API refuses to start with an owner or BYPASSRLS role. See [ENVIRONMENT_STRATEGY](docs/deployment/ENVIRONMENT_STRATEGY.md).
 
 ## Deploy
 

@@ -1,0 +1,152 @@
+# Quality gates for jarlore-be. Every database here is a throwaway PostgreSQL 18
+# service container: CI never reads or writes Neon, and needs no secrets.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, "feat/**", "fix/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  STATICCHECK_VERSION: v0.8.2
+  SQLC_VERSION: 1.31.1
+  REDOCLY_VERSION: 2.76.0
+
+jobs:
+  go:
+    name: Go checks and tests (PostgreSQL 18)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      # Superuser of the throwaway service: the tests create their own roles and
+      # one database per package, and drop them afterwards.
+      JARLORE_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "Run gofmt on:"; echo "$unformatted"; exit 1; fi
+      - name: go vet
+        run: go vet ./...
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} ./...
+      - name: build
+        run: go build ./...
+      - name: Linux build (the Cloud Run target)
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/api ./cmd/api && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/migrate ./cmd/migrate
+
+      - name: Migrations apply cleanly as a non-superuser owner, and twice
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -v ON_ERROR_STOP=1 -f scripts/local-db.sql
+          export DIRECT_DATABASE_URL='postgres://jarlore_owner:jarlore_owner_local@localhost:5432/jarlore?sslmode=disable'
+          go run ./cmd/migrate up
+          go run ./cmd/migrate up   # idempotent: nothing left to apply
+          go run ./cmd/migrate status
+          psql -h localhost -U postgres -d jarlore -v ON_ERROR_STOP=1 -c 'GRANT jarlore_app TO jarlore_api'
+
+      - name: Tests (pgx statement cache)
+        run: go test -count=1 ./...
+      - name: Tests (pgx exec mode, as behind a pooler without prepared statements)
+        run: JARLORE_TEST_EXEC_MODE=exec go test -count=1 ./...
+      - name: Race detector
+        run: go test -race -count=1 ./...
+
+      - uses: sqlc-dev/setup-sqlc@v4
+        with:
+          sqlc-version: ${{ env.SQLC_VERSION }}
+      - name: sqlc generated code is up to date
+        run: sqlc diff
+
+      - name: OpenAPI lint
+        run: npx --yes @redocly/cli@${REDOCLY_VERSION} lint api/openapi.yaml
+
+  container:
+    name: Container image builds, runs as non-root, refuses unsafe roles
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build
+        run: docker build -t jarlore-api:ci .
+      - name: Prepare a migrated database with the migrate binary from the image
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -v ON_ERROR_STOP=1 -f scripts/local-db.sql
+          docker run --rm --network host --entrypoint /usr/local/bin/migrate \
+            -e DIRECT_DATABASE_URL='postgres://jarlore_owner:jarlore_owner_local@localhost:5432/jarlore?sslmode=disable' \
+            jarlore-api:ci up
+          psql -h localhost -U postgres -d jarlore -v ON_ERROR_STOP=1 -c 'GRANT jarlore_app TO jarlore_api'
+      - name: The image contains no secrets or source
+        run: |
+          id=$(docker create jarlore-api:ci)
+          docker export "$id" | tar -t > /tmp/files.txt
+          docker rm "$id" >/dev/null
+          if grep -E '(^|/)\.env|\.pem$|\.key$|\.go$|(^|/)\.git/' /tmp/files.txt; then echo "unexpected files in the image"; exit 1; fi
+          grep -E '^usr/local/bin/(api|migrate)$' /tmp/files.txt
+      - name: Runs as non-root
+        run: test "$(docker inspect --format '{{.Config.User}}' jarlore-api:ci)" = "nonroot:nonroot"
+      - name: Refuses to start with the migration owner as its runtime role
+        run: |
+          set +e
+          docker run --rm --network host \
+            -e APP_ENV=production -e PORT=18081 \
+            -e DATABASE_URL='postgres://jarlore_owner:jarlore_owner_local@localhost:5432/jarlore?sslmode=disable' \
+            -e AUTH_JWKS_URL=https://auth.invalid/.well-known/jwks.json -e AUTH_ISSUER=https://auth.invalid \
+            -e FRONTEND_ORIGIN=https://app.invalid -e CURSOR_SIGNING_SECRET=ci-only-cursor-secret-0123456789abcdef \
+            jarlore-api:ci > /tmp/owner.log 2>&1
+          code=$?
+          set -e
+          cat /tmp/owner.log
+          test "$code" -ne 0
+          grep -q 'unsafe runtime database role' /tmp/owner.log
+          if grep -q 'jarlore_owner_local' /tmp/owner.log; then echo "password leaked into logs"; exit 1; fi
+      - name: Starts on $PORT, answers health checks, stops gracefully on SIGTERM
+        run: |
+          docker run -d --name api --network host \
+            -e APP_ENV=production -e PORT=18080 \
+            -e DATABASE_URL='postgres://jarlore_api:jarlore_api_local@localhost:5432/jarlore?sslmode=disable' \
+            -e AUTH_JWKS_URL=https://auth.invalid/.well-known/jwks.json -e AUTH_ISSUER=https://auth.invalid \
+            -e FRONTEND_ORIGIN=https://app.invalid -e CURSOR_SIGNING_SECRET=ci-only-cursor-secret-0123456789abcdef \
+            jarlore-api:ci
+          for i in $(seq 1 30); do curl -fsS http://localhost:18080/health/live && break; sleep 1; done
+          curl -fsS http://localhost:18080/health/live
+          curl -fsS http://localhost:18080/health/ready
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18080/v1/me)" = "401"
+          docker stop --time 10 api
+          docker logs api
+          test "$(docker inspect --format '{{.State.ExitCode}}' api)" = "0"
+          docker logs api 2>&1 | grep -q 'shutting down'

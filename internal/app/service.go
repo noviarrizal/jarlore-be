@@ -102,9 +102,20 @@ func (s *Service) read(ctx context.Context, u auth.User, fn func(q *sqlc.Queries
 	return db.MapError(s.store.UserReadTx(ctx, u.ID, fn))
 }
 
-// EnsureProfile creates the profile on the first request of a user. The result is
-// remembered for an hour per instance so normal requests skip the upsert.
-func (s *Service) EnsureProfile(ctx context.Context, u auth.User) error {
+// ValidTimezone reports whether tz is an IANA time zone name the API can use
+// ("Asia/Jakarta", "Europe/London", "UTC"). "Local" and empty names are refused.
+func ValidTimezone(tz string) bool {
+	if tz == "" || len(tz) > 64 || strings.EqualFold(tz, "local") {
+		return false
+	}
+	_, err := time.LoadLocation(tz)
+	return err == nil
+}
+
+// EnsureProfile creates the profile on the first request of a user, in the time
+// zone tzHint when it is a valid IANA name (else UTC). The result is remembered
+// for an hour per instance so normal requests skip the upsert.
+func (s *Service) EnsureProfile(ctx context.Context, u auth.User, tzHint string) error {
 	s.ensuredMu.Lock()
 	t, ok := s.ensured[u.ID]
 	s.ensuredMu.Unlock()
@@ -112,7 +123,11 @@ func (s *Service) EnsureProfile(ctx context.Context, u auth.User) error {
 		return nil
 	}
 	err := s.store.UserTx(ctx, u.ID, func(q *sqlc.Queries) error {
-		_, err := q.EnsureProfile(ctx, sqlc.EnsureProfileParams{ID: u.ID, Email: u.Email})
+		var tz *string
+		if ValidTimezone(tzHint) {
+			tz = &tzHint
+		}
+		_, err := q.EnsureProfile(ctx, sqlc.EnsureProfileParams{ID: u.ID, Email: u.Email, Timezone: tz})
 		if db.IsNoRows(err) { // unchanged row: DO UPDATE ... WHERE matched nothing
 			return nil
 		}

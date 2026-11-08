@@ -1,6 +1,15 @@
 # Cloud Run deployment
 
-Facts checked on 2026-11-06 against cloud.google.com pricing and Cloud Run docs. Prices and allowances change; re-check before relying on them. **Nothing has been deployed.** Deploying creates billable resources and needs the founder's go-ahead and a billing account.
+Facts checked on 2026-11-06 against cloud.google.com pricing and Cloud Run docs; reviewed 2026-11-08 for the P0 hardening. Prices and allowances change; re-check before relying on them. **Nothing has been deployed.** Deploying creates billable resources and needs the founder's go-ahead and a billing account.
+
+Status of the artifacts (2026-11-08):
+
+| Artifact | State |
+|---|---|
+| `Dockerfile` (API) | Built and run by the `container` job in `.github/workflows/ci.yml` (Docker is not installed on the development machine); see P0_HARDENING_REPORT.md for the latest result |
+| `deploy/cloudrun.service.yaml` | Reviewed; placeholders `PROJECT_ID`, `VERSION`, `NEON_AUTH_HOST`, `FRONTEND_ORIGIN` still to fill |
+| Frontend service | `jarlore-fe/Dockerfile` and `jarlore-fe/deploy/cloudrun.service.yaml`, same region (jarlore-fe/docs/deployment/FRONTEND_HOSTING.md) |
+| GCP project, billing, secrets, deploy | Not created |
 
 ## 1. What runs where
 
@@ -12,6 +21,7 @@ Facts checked on 2026-11-06 against cloud.google.com pricing and Cloud Run docs.
 | Size | 1 vCPU, 512 MiB | 512 MiB is the gen2 minimum; Go uses a fraction of it. Under 1 vCPU forces concurrency 1 |
 | Concurrency | 20 | Requests share an instance and queue briefly for one of its 4 DB connections |
 | Timeout | 30 s (the API's own deadline is 15 s) | Covers a Neon compute resuming |
+| Startup | Database role guard, then listen | `cmd/api` refuses to serve if `DATABASE_URL` is an owner, superuser or BYPASSRLS role (up to 20 s while Neon resumes); the startup probe allows 30 s |
 | Probes | Startup and liveness on `/health/live` | Never touches the database, so a sleeping Neon compute can't get instances killed |
 | Image | Multi-stage Dockerfile → `distroless/static-debian13:nonroot`, ~15 MB | Small, non-root, CA certificates included, no shell |
 | Shutdown | SIGTERM → 8 s graceful drain → exit | Cloud Run sends SIGKILL 10 s after SIGTERM |
@@ -77,11 +87,13 @@ gcloud run deploy jarlore-api --source . --region $REGION --service-account $SA 
   --cpu 1 --memory 512Mi --concurrency 20 --min-instances 0 --max-instances 2 --timeout 30 --cpu-throttling \
   --set-env-vars APP_ENV=production,DB_MAX_CONNS=4,FRONTEND_ORIGIN=https://app.jarlore.example,AUTH_ISSUER=https://NEON_AUTH_HOST,AUTH_JWKS_URL=https://NEON_AUTH_HOST/neondb/auth/.well-known/jwks.json \
   --set-secrets DATABASE_URL=jarlore-database-url:latest,CURSOR_SIGNING_SECRET=jarlore-cursor-secret:latest \
-  --startup-probe httpGet.path=/health/live,periodSeconds=2,failureThreshold=5,timeoutSeconds=1 \
+  --startup-probe httpGet.path=/health/live,periodSeconds=2,failureThreshold=15,timeoutSeconds=1 \
   --liveness-probe httpGet.path=/health/live,periodSeconds=60,failureThreshold=3,timeoutSeconds=2
 ```
 
-Run migrations from your machine (or a one-off Cloud Run job later) **before** deploying an API version that needs them: `DIRECT_DATABASE_URL=... go run ./cmd/migrate up`.
+Run migrations from your machine (or a one-off Cloud Run job later) **before** deploying an API version that needs them, loading the production file on purpose (ENVIRONMENT_STRATEGY.md): `set -a; . ./.env.production; set +a; go run ./cmd/migrate up`.
+
+If a revision never becomes ready, read its logs first: `unsafe runtime database role` means the `jarlore-database-url` secret holds the owner URL instead of the pooled `jarlore_api` URL.
 
 Smoke test:
 
@@ -107,7 +119,19 @@ The first request after idle is therefore noticeably slower; later ones are fast
 - Billing → Reports, filtered by service (Cloud Run, Artifact Registry, Cloud Build, Secret Manager).
 - Keep `max-instances` low; that is the most effective guard. Delete old image versions.
 
-## 6. Hardening still to do
+## 6. Settings review (2026-11-08)
+
+| Setting | Value | Still right? |
+|---|---|---|
+| CPU / memory | 1 vCPU / 512 MiB | Yes. Go idles at a few MiB; 512 MiB is the gen2 floor |
+| Instances | min 0 / max 2 | Yes for beta. Raise max only together with a look at Neon's pooler limits |
+| Concurrency | 20 | Yes. Each instance holds at most `DB_MAX_CONNS`=4 connections, so extra requests queue in the pool instead of opening connections |
+| DB connections | 2 × 4 = 8 through Neon's pooler (PgBouncer, transaction mode) | Far below the pooler's client limit |
+| Timeout | 30 s (API deadline 15 s, pgx connect timeout 10 s) | Yes |
+| Region | `asia-southeast1` | Yes: same city as Neon `aws-ap-southeast-1` and its Neon Auth |
+| Startup probe | 2 s × 15 | Raised from 5 failures for the role guard |
+
+## 7. Hardening still to do
 
 - Restrict CORS to the real frontend origin (`FRONTEND_ORIGIN`); the frontend calls the API server-side, so CORS only matters for future browser calls.
 - Rate limits are not implemented yet (P1); `max-instances` and the per-instance DB pool bound the blast radius meanwhile.

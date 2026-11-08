@@ -1,6 +1,7 @@
 // Command api is the Jarlore HTTP API. It is built for Cloud Run: it listens on
-// $PORT on all interfaces, starts without touching the database, and shuts down
-// gracefully on SIGTERM within Cloud Run's 10-second grace period.
+// $PORT on all interfaces, checks once at startup that its database role is
+// subject to row level security, and shuts down gracefully on SIGTERM within
+// Cloud Run's 10-second grace period.
 package main
 
 import (
@@ -58,6 +59,16 @@ func run() error {
 		return err
 	}
 	defer pool.Close()
+	// Refuse to serve if DATABASE_URL could skip row level security (an owner,
+	// superuser or BYPASSRLS role). Runs before listening, so no request is served
+	// with an unsafe identity; a resuming Neon compute gets up to 20 s.
+	guardCtx, cancelGuard := context.WithTimeout(ctx, 20*time.Second)
+	role, err := db.GuardRuntimeRole(guardCtx, pool)
+	cancelGuard()
+	if err != nil {
+		return err
+	}
+	slog.Info("database role checked", "role", role.User)
 	store := &db.Store{Pool: pool}
 
 	verifier, err := auth.NewVerifier(ctx, cfg.AuthJWKSURL, cfg.AuthIssuer, cfg.AuthAudience)

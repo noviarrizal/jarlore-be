@@ -1,7 +1,9 @@
 -- name: EnsureProfile :one
 -- Creates the profile on the first authenticated request and re-syncs the email claim.
-INSERT INTO profiles (id, email)
-VALUES (@id, sqlc.narg(email))
+-- The time zone (the browser's, validated by the API) is used only when the row is
+-- created; later changes go through PATCH /v1/me.
+INSERT INTO profiles (id, email, timezone)
+VALUES (@id, sqlc.narg(email), coalesce(sqlc.narg(timezone)::text, 'UTC'))
 ON CONFLICT (id) DO UPDATE SET email = excluded.email, updated_at = now()
   WHERE profiles.email IS DISTINCT FROM excluded.email
 RETURNING *;

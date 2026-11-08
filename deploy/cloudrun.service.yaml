@@ -47,10 +47,12 @@ spec:
               valueFrom: { secretKeyRef: { name: jarlore-cursor-secret, key: latest } }
           # Liveness never touches the database, so a suspended Neon compute can't
           # get healthy instances killed. Readiness of the DB is /health/ready (for humans and uptime checks).
+          # The API checks its database role before it listens (up to 20 s while a
+          # suspended Neon compute resumes), so allow 30 s to start.
           startupProbe:
             httpGet: { path: /health/live, port: 8080 }
             periodSeconds: 2
-            failureThreshold: 5
+            failureThreshold: 15
             timeoutSeconds: 1
           livenessProbe:
             httpGet: { path: /health/live, port: 8080 }
