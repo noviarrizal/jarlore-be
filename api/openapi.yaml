@@ -1,12 +1,15 @@
 openapi: 3.1.0
 info:
   title: Jarlore API
-  version: 0.1.0
+  version: 0.2.0
   summary: HTTP JSON API for Jarlore, a personal fermentation workspace.
   description: |
-    Contract between the Jarlore Next.js frontend and the Jarlore backend (jarlore-be).
-    No implementation exists yet. This file is the source of truth for request and
-    response shapes. See docs/architecture/API_CONTRACT.md for conventions.
+    Contract between the Jarlore Next.js frontend and the Jarlore Go backend (jarlore-be).
+    This file is the source of truth for request and response shapes; the backend's
+    contract tests validate real responses against it. See docs/architecture/API_CONTRACT.md.
+
+    Operations marked `x-implementation-status: planned` are designed but not served
+    yet (the API answers 404 `not_found`, or 405 when the path serves other methods).
 
     - JSON fields are camelCase. IDs are opaque strings (UUIDs). Timestamps are ISO 8601 UTC.
     - Errors use RFC 9457 `application/problem+json` (schema `Problem`).
@@ -19,10 +22,14 @@ info:
     name: Jarlore
 servers:
   - url: https://api.jarlore.example
-    description: Production (placeholder host, to be confirmed). Local development uses the same paths on the port set by PORT.
+    description: Production (placeholder host, to be confirmed on Cloud Run).
+  - url: http://localhost:8080
+    description: Local development (PORT defaults to 8080).
 security:
   - bearerAuth: []
 tags:
+  - name: Health
+    description: Liveness and readiness probes.
   - name: Me
     description: Profile, preferences and account deletion.
   - name: Reference data
@@ -53,6 +60,37 @@ tags:
     description: Unauthenticated, token-addressed resources.
 
 paths:
+  # ---------------------------------------------------------------- Health
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: getLiveness
+      summary: Process liveness (never touches the database)
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: getReadiness
+      summary: Readiness (the database answers; this wakes a suspended Neon compute)
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+        '503':
+          description: Database not reachable yet (code `unavailable`)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   # ---------------------------------------------------------------- Me
   /v1/me:
     get:
@@ -88,6 +126,7 @@ paths:
     delete:
       tags: [Me]
       operationId: deleteMe
+      x-implementation-status: planned
       summary: Request account deletion (two-step, asynchronous)
       description: |
         Step 1: call without `confirmationToken`. The API emails a single-use token
@@ -194,6 +233,7 @@ paths:
       operationId: createBatch
       summary: Create a batch (blank, from a recipe version, or Brew Again from a batch)
       description: |
+        Custom (single-stage) batches use stage `f1` for their one `ferment` stage.
         Applies the recipe version rule (see DOMAIN_MODEL.md, "Version rule"):
         when `source` resolves to a recipe version and recipe-level fields
         (ingredients per litre, `params.targetF1Days`) differ, the server creates
@@ -227,7 +267,10 @@ paths:
       tags: [Batches]
       operationId: previewBatchDiff
       summary: Live diff between a base (batch, bottle or recipe version) and a draft batch
-      description: Read-only. Nothing is persisted. Used by the Brew Again form.
+      description: |
+        Read-only. Nothing is persisted. Used by the Brew Again form. With a bottle base the
+        bottle's batch is used. `willCreateVersion` says whether starting this draft would
+        create recipe version `nextVersionNo` under the version rule.
       requestBody:
         required: true
         content:
@@ -529,13 +572,67 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
 
   # ---------------------------------------------------------------- Bottles
+  /v1/bottles/diff-preview:
+    post:
+      tags: [Bottles]
+      operationId: previewBottleDiff
+      summary: Live diff between a base (earlier bottle or bottle recipe version) and a draft bottle
+      description: Read-only. Says whether the draft would create a new bottle recipe version.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BottleDiffPreviewRequest' }
+      responses:
+        '200':
+          description: Diff rows
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiffResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /v1/bottles/{bottleId}/save-as-recipe:
+    parameters:
+      - $ref: '#/components/parameters/BottleId'
+    post:
+      tags: [Recipes]
+      operationId: saveBottleAsRecipe
+      summary: Create a bottle (F2) recipe v1 from one bottle, or a new version of an existing bottle recipe
+      description: |
+        The recipe has `scope: bottle`. Its versions hold the bottle's flavour, additions,
+        priming sugar, headspace and size. A bottle brewed without a recipe is linked to
+        the new version; its own data never changes.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SaveAsRecipeRequest' }
+      responses:
+        '201':
+          description: Recipe (its `latestVersion` is the version just created)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
   /v1/bottles/{bottleId}:
     parameters:
       - $ref: '#/components/parameters/BottleId'
     patch:
       tags: [Bottles]
       operationId: updateBottle
-      summary: Update a bottle (label, flavour, additions, conditions, or move to chilled)
+      summary: Update a bottle (setup, chill or discard, or mark it as the best bottle of its batch)
+      description: |
+        Setup fields (label, flavour, size, additions, priming sugar, headspace) may change only
+        while the bottle is open and was not brewed from a recipe version (422 `field_immutable`).
+        `isReference: true` requires a finished bottle and clears the flag on the batch's other bottles.
       requestBody:
         required: true
         content:
@@ -559,6 +656,7 @@ paths:
       tags: [Bottles]
       operationId: finishBottle
       summary: Finish and rate one bottle
+      description: A bottle that was closed unrated when its batch finished may be rated once.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKeyOptional'
       requestBody:
@@ -608,6 +706,9 @@ paths:
         - name: type
           in: query
           schema: { $ref: '#/components/schemas/FermentationTypeId' }
+        - name: scope
+          in: query
+          schema: { $ref: '#/components/schemas/RecipeScope' }
         - name: archived
           in: query
           schema: { type: boolean, default: false }
@@ -695,6 +796,25 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v1/recipe-versions/{versionId}:
+    parameters:
+      - name: versionId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Recipes]
+      operationId: getRecipeVersionById
+      summary: Get one immutable version by its id, with its recipe's name, scope and type
+      responses:
+        '200':
+          description: Version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecipeVersionDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /v1/recipes/{recipeId}/diff:
     parameters:
       - $ref: '#/components/parameters/RecipeId'
@@ -729,7 +849,7 @@ paths:
     get:
       tags: [Recipes]
       operationId: listRecipeBatches
-      summary: Batches brewed from any version of this recipe (newest first)
+      summary: Batches brewed from any version of this recipe, or holding a bottle of a bottle recipe (newest first)
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
@@ -771,11 +891,7 @@ paths:
     get:
       tags: [Measurements]
       operationId: listMeasurementDefinitions
-      summary: System and own definitions (archived excluded unless requested)
-      parameters:
-        - name: includeArchived
-          in: query
-          schema: { type: boolean, default: false }
+      summary: System and own definitions (archived ones excluded)
       responses:
         '200':
           description: Definitions
@@ -818,6 +934,7 @@ paths:
     patch:
       tags: [Measurements]
       operationId: updateMeasurementDefinition
+      x-implementation-status: planned
       summary: Update label, decimals or range (key and unit are fixed once used)
       requestBody:
         required: true
@@ -838,6 +955,7 @@ paths:
     delete:
       tags: [Measurements]
       operationId: deleteMeasurementDefinition
+      x-implementation-status: planned
       summary: Delete an unused definition, or archive it when measurements reference it
       responses:
         '200':
@@ -854,19 +972,20 @@ paths:
     get:
       tags: [Reminders]
       operationId: listReminders
-      summary: List reminders (ordered by dueAt ascending)
+      summary: List reminders (dueAt ascending, at most 200; nextCursor is null until paging is needed)
       parameters:
         - name: status
           in: query
           schema: { $ref: '#/components/schemas/ReminderStatus' }
+        - name: batchId
+          in: query
+          schema: { type: string, format: uuid }
         - name: from
           in: query
           schema: { type: string, format: date-time }
         - name: to
           in: query
           schema: { type: string, format: date-time }
-        - $ref: '#/components/parameters/Cursor'
-        - $ref: '#/components/parameters/Limit'
       responses:
         '200':
           description: Page of reminders
@@ -878,6 +997,7 @@ paths:
     post:
       tags: [Reminders]
       operationId: createReminder
+      x-implementation-status: planned
       summary: Create a manual reminder
       requestBody:
         required: true
@@ -924,6 +1044,7 @@ paths:
     get:
       tags: [Reminders]
       operationId: getCalendarFeed
+      x-implementation-status: planned
       summary: Private .ics feed URL
       responses:
         '200':
@@ -937,6 +1058,7 @@ paths:
     post:
       tags: [Reminders]
       operationId: rotateCalendarToken
+      x-implementation-status: planned
       summary: Invalidate the current feed URL and issue a new one
       responses:
         '200':
@@ -951,6 +1073,7 @@ paths:
     get:
       tags: [Public]
       operationId: getCalendarIcs
+      x-implementation-status: planned
       summary: Public iCalendar feed (no auth, unguessable token)
       description: Returns pending and snoozed reminders from now to +30 days. An unknown or rotated token returns 404.
       security: []
@@ -973,6 +1096,7 @@ paths:
     post:
       tags: [Exports]
       operationId: createExport
+      x-implementation-status: planned
       summary: Start a full data export (ZIP of CSV per table plus nested JSON)
       responses:
         '202':
@@ -995,6 +1119,7 @@ paths:
     get:
       tags: [Exports]
       operationId: getExport
+      x-implementation-status: planned
       summary: Export status and, when ready, a short-lived signed download URL
       responses:
         '200':
@@ -1023,6 +1148,7 @@ paths:
     post:
       tags: [Billing]
       operationId: createCheckout
+      x-implementation-status: planned
       summary: Create a Merchant-of-Record checkout for an allow-listed price
       requestBody:
         required: true
@@ -1044,6 +1170,7 @@ paths:
     get:
       tags: [Billing]
       operationId: getBillingPortal
+      x-implementation-status: planned
       summary: Customer portal URL at the billing provider
       responses:
         '200':
@@ -1058,6 +1185,7 @@ paths:
     post:
       tags: [Webhooks]
       operationId: receiveBillingWebhook
+      x-implementation-status: planned
       summary: Billing provider webhook (signature-verified, idempotent)
       description: |
         Authenticated by the provider's signature over the raw body, not by JWT.
@@ -1095,7 +1223,7 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: Access token issued by the auth provider (default Supabase Auth), verified by the API via JWKS.
+      description: Access token (EdDSA JWT) issued by Neon Auth, verified by the API via JWKS.
 
   parameters:
     BatchId:
@@ -1238,6 +1366,24 @@ components:
     Plan:
       type: string
       enum: [free, pro]
+    RecipeScope:
+      type: string
+      enum: [batch, bottle]
+      description: '`batch` is a base (F1 or single-stage) recipe; `bottle` is an F2 bottle recipe.'
+    DiffCategory:
+      type: string
+      enum: [recipe, variation, environment, measurement, outcome]
+      description: |
+        What kind of difference a row is: a recipe-level choice, how this batch or bottle was
+        actually run, the conditions around it, a reading, or the result.
+    MeasurementKind:
+      type: string
+      enum: [numeric, scale, boolean, text]
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, ready] }
 
     # ------------------------------------------------------------ reference data
     FermentationStage:
@@ -1256,13 +1402,19 @@ components:
           description: '[min, max] typical days. Reference only, never a verdict.'
     FermentationType:
       type: object
-      required: [id, name, stages]
+      required: [id, name, stages, defaultVolumeMl, defaultIngredients, defaultParams]
       properties:
         id: { $ref: '#/components/schemas/FermentationTypeId' }
         name: { type: string }
         stages:
           type: array
           items: { $ref: '#/components/schemas/FermentationStage' }
+        defaultVolumeMl: { type: integer, minimum: 1, description: 'Starting size for a blank batch.' }
+        defaultIngredients:
+          type: array
+          description: Starting ingredients for a blank batch. A suggestion, edited before saving.
+          items: { $ref: '#/components/schemas/IngredientInput' }
+        defaultParams: { $ref: '#/components/schemas/BatchParams' }
 
     # ------------------------------------------------------------ value objects
     IngredientInput:
@@ -1293,8 +1445,16 @@ components:
       required: [definitionKey, value, unit, method]
       properties:
         definitionKey: { type: string, pattern: '^[a-z0-9_]{2,40}$' }
-        value: { type: number }
-        unit: { type: string, maxLength: 16 }
+        value:
+          type: [number, boolean, string]
+          description: A number for numeric and scale definitions, true/false for boolean, text for text.
+        unit:
+          type: string
+          maxLength: 16
+          description: |
+            The unit as entered. Temperatures, volumes and masses may use any unit of their
+            quantity (°F for temp); the API also stores the canonical value, so 22 °C and
+            71.6 °F compare as equal. Empty for boolean and text.
         method:
           type: [string, 'null']
           enum: [strip, meter, refractometer, hydrometer, thermometer, sensor, taste, estimate, other, null]
@@ -1330,12 +1490,13 @@ components:
         starterSource: { type: string, maxLength: 200 }
     RecipeVersionRef:
       type: object
-      required: [recipeId, recipeName, versionId, versionNo]
+      required: [recipeId, recipeName, versionId, versionNo, scope]
       properties:
         recipeId: { type: string, format: uuid }
         recipeName: { type: string }
         versionId: { type: string, format: uuid }
         versionNo: { type: integer, minimum: 1 }
+        scope: { $ref: '#/components/schemas/RecipeScope' }
     CompareItemRef:
       type: object
       required: [type, id]
@@ -1350,13 +1511,14 @@ components:
         id: { type: string, format: uuid }
     DiffRow:
       type: object
-      required: [key, label, group, values, unit, differs, direction]
+      required: [key, label, group, category, values, unit, differs, direction]
       properties:
-        key: { type: string, examples: ['ingredients.sugar.cane_sugar', 'params.targetF1Days'] }
+        key: { type: string, examples: ['ingredients.sugar.cane_sugar', 'params.targetF1Days', 'additions.ginger.form'] }
         label: { type: string }
         group:
           type: string
           enum: [ingredients, params, additions, process, measurements, result]
+        category: { $ref: '#/components/schemas/DiffCategory' }
         values:
           type: array
           items: { type: [string, number, 'null'] }
@@ -1376,6 +1538,13 @@ components:
           type: array
           items: { $ref: '#/components/schemas/DiffRow' }
         changeCount: { type: integer, minimum: 0 }
+        willCreateVersion:
+          type: boolean
+          description: Previews only. True when starting the draft creates a new recipe version.
+        nextVersionNo:
+          type: integer
+          minimum: 2
+          description: Previews only, when willCreateVersion is true.
 
     # ------------------------------------------------------------ profile
     Me:
@@ -1464,7 +1633,7 @@ components:
         nextCursor: { type: [string, 'null'] }
     Bottle:
       type: object
-      required: [id, batchId, label, flavorName, volumeMl, additions, primingSugarG, headspaceCm, status, startedAt, finishedAt, lastMeasurements, rating]
+      required: [id, batchId, label, flavorName, volumeMl, additions, primingSugarG, headspaceCm, status, startedAt, finishedAt, lastMeasurements, rating, recipeVersion, parentBottleId, hypothesis, changedFields, isReference]
       properties:
         id: { type: string, format: uuid }
         batchId: { type: string, format: uuid }
@@ -1487,6 +1656,18 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Rating'
             - type: 'null'
+        recipeVersion:
+          description: The bottle recipe version this bottle was brewed from (frozen snapshot kept server-side).
+          oneOf:
+            - $ref: '#/components/schemas/RecipeVersionRef'
+            - type: 'null'
+        parentBottleId: { type: [string, 'null'], format: uuid, description: 'The earlier bottle this one repeats.' }
+        hypothesis: { type: [string, 'null'], description: 'What this bottle changes, and why.' }
+        changedFields:
+          type: array
+          description: Diff keys that differ from the source bottle or recipe version, fixed at creation.
+          items: { type: string }
+        isReference: { type: boolean, description: 'Marked as the best bottle of its batch.' }
     BottleInput:
       type: object
       additionalProperties: false
@@ -1501,6 +1682,14 @@ components:
           items: { $ref: '#/components/schemas/Addition' }
         primingSugarG: { type: [number, 'null'], minimum: 0, maximum: 1000 }
         headspaceCm: { type: [number, 'null'], minimum: 0, maximum: 50 }
+        source:
+          description: Start from a bottle recipe version or repeat an earlier bottle. The version rule applies to the additions.
+          type: object
+          required: [type, id]
+          properties:
+            type: { type: string, enum: [recipe_version, bottle] }
+            id: { type: string, format: uuid }
+        hypothesis: { type: [string, 'null'], maxLength: 1000 }
     CreateBottlesRequest:
       type: object
       additionalProperties: false
@@ -1530,6 +1719,7 @@ components:
           type: string
           enum: [conditioning, chilled, discarded]
           description: Use POST /v1/bottles/{id}/finish to finish. Allowed transitions are listed in DOMAIN_MODEL.md.
+        isReference: { type: boolean, description: 'Mark (or unmark) a finished bottle as the best of its batch.' }
     FinishBottleRequest:
       type: object
       additionalProperties: false
@@ -1589,7 +1779,7 @@ components:
     # ------------------------------------------------------------ batches
     BatchSummary:
       type: object
-      required: [id, code, name, fermentationTypeId, status, stage, archivedAt, startedAt, finishedAt, volumeMl, vessel, recipeVersion, parentBatchId, hypothesis, isReference, rating, bottleCount, lastLog, nextReminder]
+      required: [id, code, name, fermentationTypeId, status, stage, archivedAt, startedAt, finishedAt, volumeMl, vessel, recipeVersion, parentBatchId, hypothesis, changedFields, isReference, rating, bottleCount, lastLog, nextReminder]
       properties:
         id: { type: string, format: uuid }
         code: { type: string, examples: [KB-014] }
@@ -1608,6 +1798,7 @@ components:
             - type: 'null'
         parentBatchId: { type: [string, 'null'], format: uuid }
         hypothesis: { type: [string, 'null'] }
+        changedFields: { type: array, items: { type: string }, description: 'Diff keys that differ from the source batch or recipe version, fixed at creation.' }
         isReference: { type: boolean }
         rating:
           oneOf:
@@ -1632,7 +1823,7 @@ components:
         nextCursor: { type: [string, 'null'] }
     Batch:
       type: object
-      required: [id, code, name, fermentationTypeId, status, stage, archivedAt, startedAt, finishedAt, volumeMl, vessel, recipeVersion, ingredients, params, parentBatchId, hypothesis, isReference, rating, bottles, lastLog, nextReminder]
+      required: [id, code, name, fermentationTypeId, status, stage, archivedAt, startedAt, finishedAt, volumeMl, vessel, recipeVersion, ingredients, params, parentBatchId, hypothesis, changedFields, isReference, rating, bottles, lastLog, nextReminder]
       properties:
         id: { type: string, format: uuid }
         code: { type: string, examples: [KB-014] }
@@ -1655,6 +1846,7 @@ components:
         params: { $ref: '#/components/schemas/BatchParams' }
         parentBatchId: { type: [string, 'null'], format: uuid }
         hypothesis: { type: [string, 'null'] }
+        changedFields: { type: array, items: { type: string } }
         isReference: { type: boolean }
         rating:
           oneOf:
@@ -1752,6 +1944,18 @@ components:
             - $ref: '#/components/schemas/CompareItemRef'
             - $ref: '#/components/schemas/RecipeVersionItemRef'
         draft: { $ref: '#/components/schemas/CreateBatchRequest' }
+    BottleDiffPreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [base, draft]
+      properties:
+        base:
+          type: object
+          required: [type, id]
+          properties:
+            type: { type: string, enum: [bottle, recipe_version] }
+            id: { type: string, format: uuid }
+        draft: { $ref: '#/components/schemas/BottleInput' }
     FinishBatchRequest:
       type: object
       additionalProperties: false
@@ -1797,7 +2001,7 @@ components:
     RecipeVersion:
       type: object
       description: Immutable. There is no update or delete operation.
-      required: [id, recipeId, versionNo, parentVersionId, changeNote, sourceBatchId, ingredients, params, defaultBottles, createdAt, batchCount, avgOverall]
+      required: [id, recipeId, versionNo, parentVersionId, changeNote, sourceBatchId, sourceBottleId, baseVolumeMl, ingredients, params, defaultBottles, bottle, changedFields, createdAt, batchCount, avgOverall]
       properties:
         id: { type: string, format: uuid }
         recipeId: { type: string, format: uuid }
@@ -1805,16 +2009,48 @@ components:
         parentVersionId: { type: [string, 'null'], format: uuid }
         changeNote: { type: [string, 'null'] }
         sourceBatchId: { type: [string, 'null'], format: uuid }
+        sourceBottleId: { type: [string, 'null'], format: uuid, description: 'Bottle scope: the bottle this version was saved from or created by.' }
+        baseVolumeMl: { type: integer, minimum: 1, description: 'Batch size (or bottle size) the amounts refer to.' }
         ingredients:
           type: array
+          description: Batch scope only; empty for bottle recipes.
           items: { $ref: '#/components/schemas/Ingredient' }
         params: { $ref: '#/components/schemas/RecipeParams' }
         defaultBottles:
           type: array
           items: { $ref: '#/components/schemas/DefaultBottle' }
+        bottle:
+          description: Bottle scope only. The bottle setup this version stands for.
+          oneOf:
+            - $ref: '#/components/schemas/BottleSpec'
+            - type: 'null'
+        changedFields:
+          type: array
+          description: Diff keys that differ from the parent version.
+          items: { type: string }
         createdAt: { type: string, format: date-time }
-        batchCount: { type: integer, minimum: 0 }
-        avgOverall: { type: [number, 'null'] }
+        batchCount: { type: integer, minimum: 0, description: 'Batches brewed from it (bottle scope: batches holding a bottle brewed from it).' }
+        avgOverall: { type: [number, 'null'], description: 'Mean overall rating of rated batches (bottle scope: bottles).' }
+    RecipeVersionDetail:
+      allOf:
+        - $ref: '#/components/schemas/RecipeVersion'
+        - type: object
+          required: [recipeName, scope, fermentationTypeId]
+          properties:
+            recipeName: { type: string }
+            scope: { $ref: '#/components/schemas/RecipeScope' }
+            fermentationTypeId: { $ref: '#/components/schemas/FermentationTypeId' }
+    BottleSpec:
+      type: object
+      required: [flavorName, volumeMl, additions, primingSugarG, headspaceCm]
+      properties:
+        flavorName: { type: string }
+        volumeMl: { type: integer, minimum: 1 }
+        additions:
+          type: array
+          items: { $ref: '#/components/schemas/Addition' }
+        primingSugarG: { type: [number, 'null'], minimum: 0 }
+        headspaceCm: { type: [number, 'null'], minimum: 0 }
     RecipeVersionPage:
       type: object
       required: [data, nextCursor]
@@ -1825,10 +2061,11 @@ components:
         nextCursor: { type: [string, 'null'] }
     Recipe:
       type: object
-      required: [id, name, fermentationTypeId, latestVersion, versionCount, batchCount, avgOverall, archivedAt, createdAt]
+      required: [id, name, scope, fermentationTypeId, latestVersion, versionCount, batchCount, avgOverall, archivedAt, createdAt]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
+        scope: { $ref: '#/components/schemas/RecipeScope' }
         fermentationTypeId: { $ref: '#/components/schemas/FermentationTypeId' }
         latestVersion: { $ref: '#/components/schemas/RecipeVersion' }
         versionCount: { type: integer, minimum: 1 }
@@ -1885,11 +2122,13 @@ components:
     # ------------------------------------------------------------ measurement definitions
     MeasurementDefinition:
       type: object
-      required: [id, key, label, unit, decimals, min, max, isSystem]
+      required: [id, key, label, kind, unit, decimals, min, max, requiresMethod, isSystem]
       properties:
         id: { type: string, format: uuid }
         key: { type: string, pattern: '^[a-z0-9_]{2,40}$' }
         label: { type: string }
+        kind: { $ref: '#/components/schemas/MeasurementKind' }
+        requiresMethod: { type: boolean, description: 'True for pH: a method (strip, meter) must be given.' }
         unit: { type: string, description: 'Canonical unit, e.g. pH, C, brix, sg, or a user-defined unit.' }
         decimals: { type: integer, minimum: 0, maximum: 4 }
         min: { type: [number, 'null'] }
@@ -1902,7 +2141,8 @@ components:
       properties:
         key: { type: string, pattern: '^[a-z0-9_]{2,40}$' }
         label: { type: string, minLength: 1, maxLength: 60 }
-        unit: { type: string, minLength: 1, maxLength: 16 }
+        kind: { $ref: '#/components/schemas/MeasurementKind' }
+        unit: { type: string, maxLength: 16, description: 'Empty for boolean and text. A mass, volume or temperature unit makes values convertible.' }
         decimals: { type: integer, minimum: 0, maximum: 4 }
         min: { type: [number, 'null'] }
         max: { type: [number, 'null'] }

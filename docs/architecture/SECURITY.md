@@ -15,12 +15,14 @@ Scope: the Jarlore API and its data. Labels: **[Blueprint]**, **[Assumption]**, 
 
 ## 2. Authentication
 
-- The frontend signs in with the auth provider (proposed Supabase Auth: email magic link/OTP and Google [Blueprint]; **[Decision to confirm]**, ADR-003).
+Implemented in `internal/auth` and `internal/api/middleware.go`. Tests in `internal/api/api_test.go` reject missing, malformed, expired, no-expiry, wrong-issuer, wrong-audience, banned, service-role, non-UUID-subject, HS256 (algorithm confusion), ES256 (algorithm not allowed) and wrongly signed tokens.
+
+- The frontend signs in with Neon Auth (Managed Better Auth: email OTP, Google), ADR-003.
 - The API accepts only `Authorization: Bearer <JWT>`. It verifies:
-  - signature against the provider's JWKS (asymmetric keys; cache keys, refetch on unknown `kid`, at most once per minute);
-  - `iss = AUTH_ISSUER`, `aud = AUTH_AUDIENCE`, `exp`, `nbf`/`iat` with ≤ 60 s skew;
-  - `sub` is a UUID; `role` is `authenticated` (Supabase), anonymous sessions are rejected.
-- **[Assumption]** If the provider project still uses a shared HS256 secret, migrate it to asymmetric signing keys before launch so the API never holds a token-minting secret.
+  - EdDSA signature against Neon Auth's JWKS (`<NEON_AUTH_BASE_URL>/.well-known/jwks.json`; keys cached, refetched on unknown `kid` at most once per minute); no other algorithm is accepted;
+  - `iss = AUTH_ISSUER` and `aud = AUTH_AUDIENCE`, both the origin of the auth URL; `exp` (15-minute tokens), `nbf`/`iat` with ≤ 60 s skew;
+  - `sub` is a UUID; `role` is `authenticated`; `banned` users are rejected.
+- The API never holds a token-minting secret. The `neon_auth` schema (users, sessions) lives in the same database, but the API role has no grant on it.
 - No API sessions or cookies. CORS allows `FRONTEND_ORIGIN` only, methods used by the contract, headers `Authorization, Content-Type, Idempotency-Key`.
 - Profile is created lazily on the first valid request (`INSERT ... ON CONFLICT DO NOTHING`).
 - Internal endpoints (`/internal/jobs/tick`) require `Authorization: Bearer <CRON_SECRET>` compared in constant time, and are not exposed in the public OpenAPI.
@@ -45,7 +47,7 @@ Scope: the Jarlore API and its data. Labels: **[Blueprint]**, **[Assumption]**, 
 
 1. **Composite foreign keys** `(parent_id, user_id)` on every child table [Blueprint]. Even a buggy query cannot attach a log to another user's batch.
 2. **Denormalized `user_id`** on every child row with an index leading on `user_id` [Blueprint].
-3. **Optional defense-in-depth RLS [Decision to confirm].** The API connects as a non-owner role without `BYPASSRLS`. Each request transaction runs `SELECT set_config('app.user_id', :sub, true)`, and policies check `user_id = current_setting('app.user_id')::uuid`. Jobs that span users (reminders, webhooks, deletion) use a separate role with `BYPASSRLS`. Trade-off: one more moving part and every query must run inside a transaction, which works with transaction-mode poolers. Recommended before public launch, not required for the first build.
+3. **Row level security (implemented, see [DATABASE_DESIGN.md](DATABASE_DESIGN.md) §6; the setting is named `jarlore.user_id`, read by `jarlore_user_id()`).** Original design: The API connects as a non-owner role without `BYPASSRLS`. Each request transaction runs `SELECT set_config('app.user_id', :sub, true)`, and policies check `user_id = current_setting('app.user_id')::uuid`. Jobs that span users (reminders, webhooks, deletion) use a separate role with `BYPASSRLS`. Trade-off: one more moving part and every query must run inside a transaction, which works with transaction-mode poolers. Recommended before public launch, not required for the first build.
 4. **Immutability triggers** on `recipe_versions`, `recipe_ingredients` and the batch snapshot [Blueprint], as a second line behind the API.
 5. Object storage paths are prefixed `{user_id}/`; the bucket is private; downloads only through short-lived signed URLs.
 
@@ -67,7 +69,7 @@ See API_CONTRACT.md §9 for values. Additionally:
 ## 8. Secrets management
 
 - Secrets live in the host's secret store and are injected as environment variables. Names are listed in `.env.example`; values are never committed (`.gitignore` excludes `.env*` except `.env.example`).
-- Highly privileged secrets: `SUPABASE_SERVICE_ROLE_KEY` (used only by the account-deletion job), MoR API keys, webhook secrets, storage keys, `DATABASE_URL`. None of them reach the frontend.
+- Highly privileged secrets: the Neon API key (used only by the account-deletion job to remove the Neon Auth user), `NEON_AUTH_COOKIE_SECRET` (frontend server only), MoR API keys, webhook secrets, storage keys, `DATABASE_URL`. None of them reach the frontend.
 - Rotation: webhook and API keys rotated on staff/device change or suspected leak; `CRON_SECRET` and `CURSOR_SIGNING_SECRET` support overlap by accepting two values during rotation [Assumption].
 - Logs and Sentry scrub `Authorization`, `Idempotency-Key`, cookies, calendar tokens in paths, signed URLs and request bodies of log notes.
 
@@ -105,3 +107,19 @@ From blueprint §16. The API is a record-keeping tool.
 - `ph` measurements require a `method` (strip, meter, ...) [Blueprint safeguard]; calibration date support is planned (`calibrated_at`).
 - `issue` log entries are stored verbatim with no classification.
 - User-created templates or measurements can never be labelled "validated".
+
+
+## 12. Implementation status (2026-11-07)
+
+| Control | Status |
+|---|---|
+| JWT verification via JWKS (ES256, RS256, EdDSA only): signature, issuer, audience, expiry, subject | Done |
+| Ownership in every query; 404 for other users' ids and for malformed ids | Done |
+| Composite foreign keys, immutability triggers, RLS, restricted runtime role (`jarlore_app`) | Done |
+| Strict request decoding (unknown fields 422, 64 KB limit) and validation independent of the frontend | Done |
+| Idempotency keys per user, stored response replayed byte for byte | Done |
+| No PostgreSQL error text in responses; `requestId` on every problem | Done |
+| CORS allow-list, security headers, no cookies on the API | Done |
+| Request logs without headers, bodies or query strings | Done |
+| Rate limiting | Not yet (P1) |
+| Webhook signatures, account deletion, audit log, calendar tokens | Not yet (billing and deletion are out of scope) |

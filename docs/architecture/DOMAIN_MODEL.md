@@ -1,6 +1,6 @@
 # Domain Model
 
-Status: draft, 2026-11-05. Labels: **[Blueprint]** reused decision, **[Assumption]** proposed here, **[Contract]** fixed by the shared API contract (`docs/api/openapi.yaml`).
+Status: draft, 2026-11-05. Labels: **[Blueprint]** reused decision, **[Assumption]** proposed here, **[Contract]** fixed by the shared API contract (`api/openapi.yaml`).
 
 ## 1. Ubiquitous language
 
@@ -430,3 +430,15 @@ For batch X, `GET /v1/batches/{id}/reference` returns the first match, excluding
 | Export | — (blueprint streamed synchronously) | New `exports` table: `status`, `storage_path`, `created_at`, `completed_at`, `expires_at`. |
 | — | — | New: `batch_code_counters (user_id, prefix, last_no)`, `idempotency_keys (user_id, key, request_hash, status, response, created_at)`, `jobs`, `audit_events`. |
 | Photo (P1) | `photos` | Unchanged; storage path `{user_id}/{batch_id}/{uuid}.webp` [Blueprint]. |
+
+## 10. As implemented (Go API, 2026-11-07)
+
+These points refine the sections above; the code and `api/openapi.yaml` win where they differ.
+
+- **Bottles are full experiments.** Besides flavour, additions, priming sugar, headspace and size, a bottle has its own status, dates, readings (bottle-scoped log entries), rating, `hypothesis`, `parentBottleId` (when it repeats an earlier bottle), `recipeVersion` + frozen snapshot (when brewed from a bottle recipe), `changedFields` and an `isReference` ("best bottle") flag, one per batch.
+- **Recipe scope** (ADR-014): `batch` recipes come from batches; `bottle` recipes come from bottles. `POST /v1/bottles/{id}/save-as-recipe` saves a bottle. The version rule (§8.3) applies to bottles created from a bottle recipe or an earlier bottle, with additions and priming sugar as the recipe-level fields.
+- **Frozen experiments.** Once a bottle is finished or discarded its setup, dates and rating never change (database trigger), except that a bottle closed unrated by its batch can be rated once, and the best flag can move. Setup edits on an open bottle are refused when it was brewed from a recipe version (its setup is the version).
+- **Measurement kinds**: numeric, scale (whole numbers in a range), boolean, text. Numeric values of temperature, volume or mass definitions are stored as entered and in the canonical unit; comparisons use the canonical value.
+- **Diff categories** separate recipe changes, variations in how a batch or bottle was run, environmental conditions, readings and outcomes (`DiffRow.category`).
+- **Reminders**: creating a batch schedules a taste check at the target F1 length (09:00 in the user's zone); bottling schedules a burp for each bottle the next morning and a "move to the fridge" reminder at the end of the typical F2 window; a burp log completes that day's burp reminder and schedules the next one while inside the F2 window; chilling, finishing or discarding dismisses open reminders. Labels never say safe or ready.
+- **Batch codes**: `KB`, `WK`, `CU` prefixes with a per-user counter (`KB-001`).

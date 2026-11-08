@@ -5,16 +5,19 @@ Format: lightweight ADRs. Status values: **Proposed** (needs founder sign-off), 
 | ADR | Title | Status |
 |---|---|---|
 | 001 | Separate HTTP API instead of the blueprint's Next.js + Supabase monolith | Accepted (founder), trade-offs documented |
-| 002 | Backend language and framework | **Proposed, open** |
-| 003 | Auth provider: Supabase Auth, API verifies JWT via JWKS | Proposed |
-| 004 | PostgreSQL host: Supabase (default) or Neon | Proposed |
+| 002 | Backend language and framework: Go (net/http + chi, pgx, sqlc, goose) | **Accepted** (2026-11-07, founder) |
+| 003 | Auth provider: Neon Auth (Managed Better Auth), API verifies EdDSA JWT via JWKS | **Accepted** (2026-11-08, replaces Supabase Auth) |
+| 004 | PostgreSQL host: Neon, the only primary database | **Accepted** (2026-11-07, replaces the Supabase default) |
 | 005 | Immutable recipe versions via copy-on-write, frozen batch snapshots | Accepted |
 | 006 | Diffs and comparisons computed server-side | Accepted |
 | 007 | Cursor pagination | Accepted |
 | 008 | RFC 9457 problem+json errors | Accepted |
 | 009 | Merchant-of-Record billing behind a provider interface | Accepted |
 | 010 | Background jobs on Postgres, no queue or broker | Accepted |
-| 011 | Defense-in-depth RLS for the API connection | Proposed |
+| 011 | Defense-in-depth RLS for the API connection | **Accepted, implemented** |
+| 012 | Hosting: Google Cloud Run, request-based billing, scale to zero | **Accepted** (2026-11-07) |
+| 013 | Contract strategy: hand-written Go DTOs checked by contract tests; generated TypeScript types | **Accepted** |
+| 014 | Recipe scope (batch or bottle) and bottle-level versioning | **Accepted** |
 
 ---
 
@@ -22,7 +25,7 @@ Format: lightweight ADRs. Status values: **Proposed** (needs founder sign-off), 
 
 **Context.** The blueprint chose one Next.js 16 app that reads and writes Supabase directly, using RLS policies, a `create_recipe_version` RPC and triggers for integrity, and Server Actions for writes. The founder has created a separate backend repository (`jarlore-be`), and a separate frontend (`jarlore-fe`) is being built in parallel.
 
-**Decision.** The frontend calls a versioned HTTP JSON API (`/v1`). Only the API talks to PostgreSQL. The API is the authority for ownership, recipe version integrity, batch snapshots and experiment integrity, validation, entitlements, diffs, comparisons and history. OpenAPI (`docs/api/openapi.yaml`) is the contract.
+**Decision.** The frontend calls a versioned HTTP JSON API (`/v1`). Only the API talks to PostgreSQL. The API is the authority for ownership, recipe version integrity, batch snapshots and experiment integrity, validation, entitlements, diffs, comparisons and history. OpenAPI (`api/openapi.yaml`) is the contract.
 
 **Consequences.**
 
@@ -43,7 +46,7 @@ Blueprint elements kept: single Postgres, no microservices, composite FKs, immut
 
 ## ADR-002: Backend language and framework
 
-**Status: Proposed, open.** Nothing is scaffolded until this is decided.
+**Status: Accepted (2026-11-07): option C, Go.** The founder chose Go with standard `net/http`, chi, pgx/v5 + pgxpool, sqlc and goose. The analysis below is kept for history; its recommendation (TypeScript + Hono) was not taken. What tipped it: the smallest runtime footprint and fastest cold start for Cloud Run's scale to zero, a single static binary, and SQL-first data access.
 
 **Context.** Solo developer, frontend-leaning, fluent in TypeScript. Workload is CRUD-heavy with transactional rules, a pure diff engine, a few background jobs (email digests, ZIP export, webhooks), and low traffic (≤ 10,000 users in the blueprint's horizon). Requirements: OpenAPI 3.1 contract-first, Postgres with transactions and row locks, easy hosting, cheap.
 
@@ -75,24 +78,31 @@ Hono vs Fastify inside option A: Hono is lighter and portable across runtimes, w
 
 ## ADR-003: Auth provider
 
-**Status: Proposed (decision to confirm).**
+**Status: Accepted (2026-11-08), revised.** **Neon Auth** (Managed Better Auth) issues identity; the API verifies its JWTs via JWKS. Replaces the 2026-11-07 choice of Supabase Auth, so data and identity sit with one vendor (ADR-004). Implemented in `internal/auth` (golang-jwt v5 + keyfunc v3, EdDSA only). Local development uses `cmd/devauth`, which signs Neon-shaped tokens with a local Ed25519 key. The frontend's Neon Auth sign-in is not built yet (P0).
 
-**Context.** The blueprint chose Supabase Auth with email OTP/magic link and Google, plus custom SMTP via Resend because the built-in sender is limited to 2 emails/hour per project. With a separate API, the provider must issue JWTs that a third-party service can verify.
+**Context.** The blueprint chose Supabase Auth with email OTP/magic link and Google. After ADR-004 moved the database to Neon, Supabase would have been a second vendor used for login only, with a free project that pauses when idle. Neon Auth is included on every Neon plan (Free: up to 60,000 monthly active users per project), keeps users in the `neon_auth` schema of the same database, branches with the database, and issues JWTs that a separate service can verify.
 
-**Decision (proposed).** Keep **Supabase Auth**. The frontend signs in with the Supabase SDK. The API verifies access tokens via the project's JWKS endpoint (asymmetric signing keys), checks `iss`, `aud`, `exp`, `sub`, and lazily creates the profile. The API uses the admin API only for account deletion.
+**Decision.** The frontend signs in with `@neon/auth` (Next.js server SDK: email OTP, and Google with our own OAuth app before launch). It sends the Neon Auth JWT as `Authorization: Bearer` to the API. The API:
+- verifies the EdDSA signature against `<NEON_AUTH_BASE_URL>/.well-known/jwks.json` (keys cached, refetched on an unknown `kid`);
+- requires `iss` = `aud` = the **origin** of the auth URL (`AUTH_ISSUER`; `AUTH_AUDIENCE` defaults to it), `exp` (tokens live 15 minutes), a UUID `sub`, `role` = `authenticated`, and not `banned`;
+- creates the profile lazily from `sub` and `email`. Application tables do not reference `neon_auth.*`, and the API's role is not granted access to that schema.
 
 **Alternatives.**
+- *Supabase Auth* (the previous choice): mature, but a second vendor whose free project pauses after inactivity.
 - *Clerk / similar hosted auth*: polished UI and JWKS, but another vendor and per-MAU pricing.
-- *Auth inside the API (e.g. a TS auth library)*: full control, but the developer owns email flows, OAuth, session security and rate limits.
-- *Neon Auth or other DB-coupled auth*: relevant only if ADR-004 picks Neon; not evaluated.
+- *Auth inside the API*: full control, but the developer owns email flows, OAuth, session security and rate limits.
 
-**Consequences.** Auth stays independent of the Postgres host. If the database moves to Neon, Supabase may be used for Auth only. The `profiles` table no longer has an FK to `auth.users`. Verify that asymmetric JWT signing keys are enabled on the project before launch.
+**Consequences.**
+- Production needs a custom SMTP provider (the shared sender `auth@mail.myneon.app` is rate-limited and cannot send verification links) and our own Google OAuth credentials; trusted domains set; "Allow Localhost" off.
+- Each Neon branch has its own auth URL, so `AUTH_ISSUER`/`AUTH_JWKS_URL` differ per environment.
+- Account deletion deletes the Neon Auth user (admin API) and the profile's data in one job.
+- To verify on the first real project: `sub` is a UUID, Neon Auth is offered in `aws-ap-southeast-1`, and how the Next.js server reads the JWT to forward it.
 
 ---
 
 ## ADR-004: PostgreSQL host
 
-**Status: Proposed.**
+**Status: Accepted (2026-11-07): Neon PostgreSQL**, region `aws-ap-southeast-1`, pooled connection for the API, direct connection for migrations. See [NEON_SETUP.md](../deployment/NEON_SETUP.md). The text below is the earlier analysis.
 
 **Context.** The blueprint chose Supabase over Neon for one-vendor Auth, Storage and Cron, and noted Supabase Free pauses after a week of inactivity (Pro $25 before public beta). With the API owning data access, Supabase's client-side features (PostgREST, RLS-as-API) are no longer used.
 
@@ -172,9 +182,9 @@ Hono vs Fastify inside option A: Hono is lighter and portable across runtimes, w
 
 ## ADR-011: Defense-in-depth RLS for the API connection
 
-**Status: Proposed.**
+**Status: Accepted and implemented** (migration 00002; tests in `internal/db/db_test.go`). The API logs in as a role that is only a member of `jarlore_app` (no `BYPASSRLS`); policies use the transaction-local `jarlore.user_id`. No job role exists yet because no jobs run.
 
-**Decision (proposed).** Keep application-level ownership as the primary control (ADR-001). Before public launch, enable RLS on user-owned tables with policies on `current_setting('app.user_id')`, set per transaction by the API. Background jobs use a separate role with `BYPASSRLS`.
+**Decision.** Keep application-level ownership as the primary control (ADR-001). Before public launch, enable RLS on user-owned tables with policies on `current_setting('app.user_id')`, set per transaction by the API. Background jobs use a separate role with `BYPASSRLS`.
 
 **Consequences.** A forgotten `WHERE user_id` returns nothing instead of leaking data. Every request must run in a transaction; tests must cover both roles. Can be postponed without contract changes.
 
@@ -186,7 +196,7 @@ Contract concerns are kept as-is in the OpenAPI file and listed here for the fou
 
 **Decisions to make**
 1. **Backend language and framework** (ADR-002). Recommendation: TypeScript + Hono on Node.
-2. **Auth provider and Postgres host** (ADR-003, ADR-004). Default: Supabase Auth + Supabase Postgres. Confirm asymmetric JWT signing keys are available on the project.
+2. **Auth provider and Postgres host** (ADR-003, ADR-004). Resolved: Neon Auth + Neon PostgreSQL.
 3. **API hosting target** (container PaaS vs serverless) and region co-located with the database.
 4. **Migration tool and schema owner.** The blueprint used the Supabase CLI as the only owner; with a separate API, choose between the Supabase CLI, plain SQL with a runner, or the framework's tool. Keep exactly one owner.
 5. **Defense-in-depth RLS** (ADR-011): now, before launch, or never.
@@ -225,3 +235,41 @@ These were found while building the jarlore-fe screens against this contract. Th
 | F3 | `diff-preview` doesn't say whether the draft will create a new recipe version | The UI explains the rule in prose only | Add `willCreateVersion` and `nextVersionNo` to the `diff-preview` response |
 | F4 | Custom batches use the stage `f1`, while the type's stage is `ferment` (also listed above) | The frontend falls back to the type's first stage | Add `ferment` to `BatchStage`, or document the mapping |
 | F5 | `GET /v1/reminders` has no `batchId` filter | Not needed yet (`Batch.nextReminder` is enough) | Add the filter when a reminders screen needs it |
+
+
+---
+
+## ADR-012: Hosting on Google Cloud Run
+
+**Status: Accepted (2026-11-07).** Region `asia-southeast1`, in the same city as Neon Singapore. Request-based billing, min instances 0, max 2, 1 vCPU / 512 MiB, concurrency 20, 30 s timeout, startup and liveness probes on `/health/live`. Container: a multi-stage Dockerfile building `distroless/static-debian13:nonroot`, chosen over Go buildpacks for a pinned toolchain, a ~15 MB non-root image and identical local builds. Details and costs: [CLOUD_RUN.md](../deployment/CLOUD_RUN.md).
+
+**Consequences.** Cold starts after idle (Cloud Run plus a Neon resume). No resident background work: future jobs use Cloud Scheduler calling an internal endpoint (ADR-010). A billing account is required even inside the free allowance, and budget alerts only notify.
+
+## ADR-013: Contract strategy
+
+**Status: Accepted.** `api/openapi.yaml` (OpenAPI 3.1) stays the contract.
+
+- **Go:** request and response types are hand-written in `internal/app` (`models.go`, `inputs.go`). oapi-codegen v2 was evaluated: it targets OpenAPI 3.0 and doesn't handle this spec's 3.1 features (type arrays with `null`, `prefixItems`, `const`) without rewriting the spec as 3.0. Instead, **contract tests** (`internal/api/api_test.go`) compile the spec as JSON Schema 2020-12 and validate every real response of the core workflow against its component schema, so drift fails the tests.
+- **TypeScript:** generated with `openapi-typescript` (supports 3.1) into `jarlore-fe/src/lib/api/schema.d.ts` (`pnpm gen:api`); `types.ts` only gives the generated shapes short names.
+
+## ADR-014: Recipe scope and bottle-level versioning
+
+**Status: Accepted.** A successful F1 batch and a successful F2 bottle can both become reusable recipes, so recipes have a `scope`:
+
+- `batch`: versions hold ingredients (compared per litre), the target F1 length and suggested bottles.
+- `bottle`: versions hold one bottle's setup: flavour, additions, priming sugar, headspace and bottle size (`bottle_spec`).
+
+The version rule applies to both. A new batch or bottle created from a version with recipe-level changes creates version n+1 (parent = that version, change note = the hypothesis, source = the new batch or bottle) and is pinned to it; conditions and labels never create versions. For bottles the recipe-level fields are the additions (form and amount) and the priming sugar; the flavour name, size and headspace are variations. Bottles keep a frozen snapshot of their version like batches, plus `parent_bottle_id` when repeating an earlier bottle, a hypothesis and `changed_fields`. One bottle per batch can be marked as the best (`isReference`).
+
+## Gaps resolved in the Go implementation (2026-11-07)
+
+| # | Gap | Resolution |
+|---|---|---|
+| F1 | Blank-batch defaults | `FermentationType` has `defaultVolumeMl`, `defaultIngredients`, `defaultParams` |
+| F2 | Version by id | `GET /v1/recipe-versions/{versionId}` (with recipe name, scope and type) |
+| F3 | Will Brew Again create a version? | `willCreateVersion` and `nextVersionNo` on `diff-preview` responses (batch and bottle) |
+| F4, 6 | `ferment` stage | Kept: custom batches use stage `f1` for their single `ferment` stage (documented on `createBatch`) |
+| F5 | Reminders per batch | `GET /v1/reminders?batchId=` |
+| 11 | Measurement kinds | Implemented: numeric, scale, boolean, text (`Measurement.value` is a number, boolean or string) |
+| — | Compare limit vs the F2 view | Bottles of one batch can always be compared (the F2 experiment view); the plan limit applies to other comparisons |
+| — | Kinds of difference | `DiffRow.category`: recipe, variation, environment, measurement, outcome |

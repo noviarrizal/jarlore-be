@@ -1,179 +1,84 @@
 # System Overview
 
-Status: draft, 2026-11-05. Source of product truth: the "Fermentation Lab" blueprint (product renamed Jarlore). Labels used below: **[Blueprint]** reused decision, **[Assumption]** not decided by the blueprint or founder, **[Decision to confirm]** proposed default awaiting founder sign-off.
+Status: implemented, 2026-11-07. Go API on Google Cloud Run, Neon PostgreSQL and Neon Auth (one vendor for data and identity).
 
-## 1. What changed since the blueprint
+## 1. Decisions in one table
 
-The blueprint proposed one Next.js monolith talking to Supabase directly, with Row Level Security (RLS) as the main authorization layer. The founder has since created a separate backend repository. The architecture is now:
+| Concern | Decision | Where |
+|---|---|---|
+| Language and framework | Go 1.27, standard `net/http` + chi router | ADR-002 |
+| Database | Neon PostgreSQL, the only primary database (Postgres 18 by default on new Neon projects; tests run on 17) | ADR-004, [DATABASE_DESIGN.md](DATABASE_DESIGN.md) |
+| Data access | SQL first: goose migrations, sqlc-generated queries, pgx/v5 + pgxpool | [DATABASE_DESIGN.md](DATABASE_DESIGN.md) |
+| Identity | Neon Auth (Managed Better Auth) issues EdDSA access tokens; the API verifies them against the JWKS | ADR-003, [SECURITY.md](SECURITY.md) |
+| Isolation | Ownership in every query, composite foreign keys, row level security, restricted runtime role | ADR-011 |
+| Hosting | Google Cloud Run, request-based billing, 0 to 2 instances | ADR-012, [CLOUD_RUN.md](../deployment/CLOUD_RUN.md) |
+| Contract | `api/openapi.yaml` (OpenAPI 3.1). Contract tests validate real responses; the frontend generates its types from it | ADR-013, [API_CONTRACT.md](API_CONTRACT.md) |
 
-```
-Next.js frontend (jarlore-fe)  ->  Jarlore API (jarlore-be, HTTP JSON, /v1)  ->  PostgreSQL
-```
-
-The browser never talks to the database. The API is the single authority for ownership, recipe version integrity, batch snapshot and experiment integrity, validation, entitlements, diffs, comparisons and history. See ADR-001.
-
-## 2. System context
+## 2. Context
 
 ```mermaid
 flowchart LR
-    user([Home brewer<br/>phone / desktop browser])
-    cal([Calendar app<br/>Google / Apple])
-
-    subgraph jarlore[Jarlore]
-        fe[Next.js frontend<br/>Vercel]
-        api[Jarlore API<br/>jarlore-be]
-    end
-
-    auth[Auth provider<br/>Supabase Auth - to confirm]
-    db[(PostgreSQL<br/>Supabase or Neon)]
-    store[(Object storage<br/>exports now, photos P1)]
-    mail[Resend<br/>transactional email]
-    mor[Merchant of Record<br/>Paddle / Creem / Polar]
-    analytics[PostHog + Umami<br/>product / marketing analytics]
-    sentry[Sentry<br/>errors]
-
-    user -->|HTTPS| fe
-    user -->|magic link / OTP / Google| auth
-    fe -->|Bearer JWT, JSON /v1| api
-    fe -->|sign-in SDK| auth
-    fe -->|overlay checkout| mor
-    fe -->|events, no note contents| analytics
-    api -->|JWKS fetch, admin API for deletion| auth
-    api -->|SQL over TLS| db
-    api -->|put / signed URL| store
-    api -->|reminders, export ready, deletion confirm| mail
-    api -->|create checkout, portal, cancel| mor
-    mor -->|signed webhooks| api
-    api -->|server events| analytics
-    fe --> sentry
-    api --> sentry
-    cal -->|GET /calendar/token.ics| api
-    auth -->|auth emails via custom SMTP| mail
+  user([Home brewer]) -->|browser, phone| fe[jarlore-fe<br/>Next.js 16]
+  fe -->|sign in| supa[Neon Auth<br/>identity]
+  fe -->|server-side fetch<br/>Bearer access token| api[jarlore-be<br/>Go on Cloud Run]
+  api -->|JWKS, cached| supa
+  api -->|pooled TLS connection<br/>PgBouncer, transaction mode| neon[(Neon PostgreSQL)]
+  ops([Founder]) -->|go run ./cmd/migrate up<br/>direct connection| neon
 ```
 
-## 3. Containers
+- The browser never calls the API with a token held in JavaScript: Next.js server components and server actions call it, reading the token from an httpOnly cookie.
+- Only the API talks to Jarlore's tables. Neon Auth keeps users and sessions in the `neon_auth` schema of the same database; the API role has no access to it.
 
-The API is one deployable process (a modular monolith). Background work runs in the same codebase, triggered by a scheduler, against a Postgres job table. No microservices and no message broker.
+## 3. Inside the API
 
-```mermaid
-flowchart TB
-    subgraph client[Browser]
-        fe[Next.js App Router UI<br/>optimistic quick log, forms, charts]
-    end
-
-    subgraph api[Jarlore API - one deployable]
-        http[HTTP layer<br/>auth middleware, problem+json, rate limit, idempotency]
-        subgraph modules[Domain modules]
-            m_me[identity + profile]
-            m_batch[batches + bottles]
-            m_log[journal + measurements]
-            m_recipe[recipes + versions]
-            m_diff[diff + compare engine<br/>pure functions]
-            m_rem[reminders + calendar]
-            m_bill[billing + entitlements]
-            m_exp[export + account deletion]
-        end
-        worker[Job runner<br/>same codebase, triggered by scheduler]
-    end
-
-    sched[Scheduler<br/>host cron or pg_cron, every 5 min]
-    db[(PostgreSQL<br/>app tables, jobs, idempotency_keys,<br/>billing_events, audit_events)]
-    store[(Object storage)]
-    ext[Resend, MoR, auth provider]
-
-    fe -->|/v1 JSON| http
-    http --> modules
-    modules --> db
-    worker --> db
-    worker --> store
-    worker --> ext
-    m_bill --> ext
-    sched -->|POST /internal/jobs/tick with CRON_SECRET| worker
+```
+cmd/api            HTTP server: config, pool, verifier, graceful shutdown (SIGTERM)
+cmd/migrate        goose migrations over DIRECT_DATABASE_URL (up, status; no down)
+cmd/devauth        LOCAL ONLY: signs EdDSA tokens like Neon Auth so the real verification path runs
+internal/config    environment, validated at startup
+internal/api       router, middleware (request id, logging, recover, CORS, timeout, auth), thin handlers
+internal/app       use cases: one transaction each, ownership checks, idempotency, read models
+internal/domain    pure rules: units, the diff engine, the recipe version rule (no I/O)
+internal/db        pool, per-user transaction (RLS context), error mapping; sqlc code in db/sqlc
+internal/auth      JWT verification against the JWKS
+internal/httpx     JSON, problem+json, strict body decoding
+db/migrations      SQL schema, triggers, RLS, seed data
+db/queries         SQL for sqlc
+api/openapi.yaml   the contract (embedded and served at /openapi.yaml)
 ```
 
-Module rules **[Assumption]**:
-- Modules call each other through plain in-process interfaces, never through HTTP.
-- Only `recipes` writes `recipe_versions`. Only `billing` writes `subscriptions` and `billing_events`.
-- `diff` has no I/O. It takes two normalized snapshots and returns `DiffRow[]`. It is the most heavily unit-tested module. [Blueprint: "diff engine ... pure function ... with unit tests"]
+Request path: `requestID → logRequests → recover → securityHeaders → CORS → timeout → authenticate (/v1 only) → handler → app.Service → db.Store.UserTx → sqlc queries`.
 
-## 4. Responsibilities: frontend vs backend
+Every use case runs in **one** transaction that first calls `set_config('jarlore.user_id', <sub>, true)`. The setting is transaction-local, so it is safe with Neon's transaction-mode pooler and can't leak to the next request on the same connection (tested).
 
-| Concern | Frontend (jarlore-fe) | Backend (jarlore-be) |
-|---|---|---|
-| Sign-in UI, session refresh | Owns (auth provider SDK) | Verifies the JWT on every request |
-| Rendering, navigation, charts, unit display formatting | Owns | Provides values and units |
-| Form UX validation (required fields, ranges) | Mirrors for fast feedback only | **Authoritative** |
-| Optimistic quick log | Owns the optimistic state and retry UI | Idempotent writes via `Idempotency-Key` |
-| Live diff in Brew Again | Displays rows | Computes rows (`POST /v1/batches/diff-preview`) |
-| Upgrade prompts | Shows the sheet on 402 `entitlement_required` | Decides the plan and limits |
-| Checkout | Opens the MoR overlay/URL | Creates the checkout, consumes webhooks |
-| Analytics | Client events (no note text) | Server events for key state changes |
+## 4. Responsibilities
 
-### Business rules that live ONLY in the backend
+| Rule | Owner |
+|---|---|
+| Who the user is | Neon Auth (token), verified by the API |
+| Ownership, isolation | API (queries) and PostgreSQL (composite FKs, RLS) |
+| Batch codes, versions, snapshots, changed fields | API, inside the write transaction |
+| Diffs, "what changed", unit normalisation | `internal/domain` (server only) |
+| Entitlements (compare limit, custom measurements) | API (`/v1/entitlements` drives the UI) |
+| Validation | API (independent of any frontend checks) |
+| Where the highlight goes in a table | Frontend only |
 
-The frontend may display hints, but it must not be trusted to enforce any of these.
+## 5. Background work
 
-| # | Rule | Enforced where |
-|---|---|---|
-| B1 | Every read and write is scoped to the JWT subject; other users' resources are 404 | Query layer + composite FKs |
-| B2 | Recipe versions are immutable; new versions are created only by the version rule or Save as Recipe | Recipes module + DB trigger |
-| B3 | Version rule on batch creation: recipe-level change creates version n+1; batch-level change is a deviation | Batches module (single transaction) |
-| B4 | The recipe snapshot is frozen at batch creation | Batches module + DB trigger |
-| B5 | Batch codes (`KB-014`) are generated per user and type prefix, unique, never reused | Batches module + unique index |
-| B6 | Batch and bottle state transitions (see DOMAIN_MODEL.md) | Batches module |
-| B7 | Ingredients are fixed after creation; a finished or discarded batch is locked except name, vessel, isReference, params.roomTempC | Batches module |
-| B8 | A bottle belongs to exactly one batch and cannot stay open after the batch closes | Batches module |
-| B9 | Measurements must reference a system or own definition; pH requires a method; value within definition min/max | Journal module |
-| B10 | Entitlements: compare items (2 free / 6 Pro), custom measurement definitions (3 free), non-adjacent recipe diffs (Pro) | Billing module, checked in each use case |
-| B11 | Diffs, comparisons, reference-batch selection, averages (`avgOverall`, `batchCount`) | Diff + recipes modules |
-| B12 | Reminder generation from stages (taste check, daily burps, chill) and cancellation on finish/discard | Reminders module |
-| B13 | Subscription state comes only from verified, de-duplicated webhooks | Billing module |
-| B14 | Export content and account deletion scope | Export module |
-| B15 | No output ever labels a ferment safe, ready, done-to-drink or passed | Copy review + label vocabulary in reminders |
+None runs today. Reminders are rows that Today reads; nothing is sent. The API keeps no background goroutines besides the hourly JWKS refresh, so an idle instance and an idle Neon compute both scale to zero. When reminder emails arrive (P1), use Cloud Scheduler calling an internal endpoint (ADR-010), not a resident worker.
 
-## 5. Background jobs
+## 6. Environments
 
-All jobs use a `jobs` table claimed with `SELECT ... FOR UPDATE SKIP LOCKED` (ADR-010). A scheduler calls one internal tick every 5 minutes; long-running hosts may also run an in-process poll loop.
-
-| Job | Trigger | Work | Retry |
+| Environment | API | Database | Auth |
 |---|---|---|---|
-| `dispatch_reminders` | Every 5 min [Blueprint] | Up to 200 due reminders (pending, or snoozed with `dueAt <= now`), one digest email per user per run via Resend, set `sent_at` | 3 attempts, then `last_error` set [Blueprint] |
-| `process_billing_event` | Enqueued by webhook handler | Apply event to `subscriptions` | Exponential backoff, 8 attempts [Assumption] |
-| `build_export` | `POST /v1/exports` | Stream CSV per table + nested JSON into a ZIP, upload, mark ready | 3 attempts |
-| `delete_account` | Confirmed `DELETE /v1/me` | Cancel subscription at MoR, delete storage objects, delete rows, delete auth identity | Retried until done; alerts on failure |
-| `purge_expired` | Daily | Delete idempotency keys > 24 h, export files > 7 days, finished job rows > 30 days | n/a |
+| Local | `go run ./cmd/api` on :8080 | Local PostgreSQL set up like Neon (`scripts/local-db.sql`) or a Neon dev branch | `go run ./cmd/devauth` |
+| Tests | `httptest` with the real router | A fresh database per test package (`JARLORE_TEST_DATABASE_URL`) | Test ES256 key |
+| Production | Cloud Run `asia-southeast1` | Neon `aws-ap-southeast-1` (Singapore) | Neon Auth (same project) |
 
-## 6. External integrations
+## 7. Cost model
 
-| Integration | Direction | Purpose | Notes |
-|---|---|---|---|
-| Auth provider (default Supabase Auth) | FE signs in; API reads JWKS; API calls admin API on deletion | Identity | Custom SMTP through Resend is mandatory: the built-in sender is limited to 2 emails/hour per project [Blueprint] |
-| PostgreSQL (Supabase or Neon) | API only | System of record | ADR-004 |
-| Resend | API out | Reminder digests, export ready, deletion confirmation | Digest per user keeps volume low [Blueprint] |
-| MoR (Paddle primary, Creem fallback, Polar second fallback) | Both | Checkout, portal, subscription webhooks | Behind a provider interface `createCheckout`, `parseWebhook`, `portalUrl` [Blueprint]. Avoid Lemon Squeezy [Blueprint] |
-| Object storage | API out, browser downloads via signed URL | Export ZIPs; photos in P1 | Supabase Storage or any S3-compatible store |
-| PostHog / Umami | FE and API out | Funnel: signup, first batch, second log, finish, brew again, compare, upgrade [Blueprint] | Never send note text or measurement notes |
-| Sentry | FE and API out | Errors | Scrub `Authorization`, calendar tokens, request bodies |
+Everything runs on free allowances at low volume, with real limits (details and sources in [CLOUD_RUN.md](../deployment/CLOUD_RUN.md) and [NEON_SETUP.md](../deployment/NEON_SETUP.md)):
 
-## 7. Deployment sketch
-
-```mermaid
-flowchart LR
-    v[Vercel<br/>jarlore-fe] -->|HTTPS| a[API host<br/>one region, 1-2 instances]
-    a -->|pooled connections| p[(Postgres<br/>same region)]
-    c[Scheduler] -->|every 5 min| a
-    a --> s[(Object storage)]
-```
-
-- **[Assumption]** Run the API as a container on a small PaaS (for example Fly.io, Railway or Render) in the same region as the database. A long-running process keeps connection pooling and the job loop simple. A serverless target (Vercel Functions, Cloudflare Workers) is possible if the framework chosen in ADR-002 supports it; then the scheduler must be the host cron or pg_cron calling the tick endpoint.
-- Place the API on a subdomain (for example `api.<domain>`), CORS-restricted to the frontend origin.
-- Migrations run from CI or manually against `DATABASE_URL_DIRECT` before deploy. The tool is not chosen yet (see unresolved questions).
-- Environments: local, staging (optional until beta), production.
-
-## 8. Cost note
-
-The blueprint estimated **~$0-1/month** in private dev, **~$45-65/month** at 1,000 users and **~$65-100+/month** at 10,000 users (Supabase Pro $25, Vercel Pro $20, Resend free tier then $20, PostHog/Sentry free), excluding MoR fees.
-
-The separate API adds one host. **[Assumption, prices not verified]** A small always-on container costs roughly $5-20/month, so expect about **$50-85/month** at 1,000 users. Two notes:
-- Supabase Free pauses after one week of inactivity, which would stop reminders, so move to Pro ($25) before public beta [Blueprint].
-- If Postgres moves to Neon, Supabase may still be used for Auth only (free tier limits to verify), and storage moves to an S3-compatible bucket.
+- Cloud Run: 180,000 vCPU-seconds, 360,000 GiB-seconds and 2 million requests a month per billing account, credited at Tier 1 prices (Singapore is Tier 2, so the allowance covers fewer seconds there). A billing account is required.
+- Neon Free: 100 CU-hours a month per project, autoscaling up to 2 CU, 1 GB storage per project, scale to zero after 5 idle minutes (cannot be disabled on Free).
+- Budget alerts notify; they do not stop spending.

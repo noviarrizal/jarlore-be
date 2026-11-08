@@ -1,6 +1,6 @@
 # Sequences
 
-Participants: **U** user, **FE** Next.js frontend, **AP** auth provider (proposed Supabase Auth), **API** Jarlore API, **DB** PostgreSQL, **J** job runner (same codebase as the API), **S** object storage, **M** Resend, **MoR** billing provider. Every API-to-DB write in a request runs in one transaction unless noted.
+Participants: **U** user, **FE** Next.js frontend, **AP** auth provider (Neon Auth), **API** Jarlore API, **DB** PostgreSQL, **J** job runner (same codebase as the API), **S** object storage, **M** Resend, **MoR** billing provider. Every API-to-DB write in a request runs in one transaction unless noted.
 
 ## 1. Authentication
 

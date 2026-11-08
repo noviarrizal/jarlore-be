@@ -1,0 +1,62 @@
+# Cloud Run service for the Jarlore API, tuned to stay inside the free allowance
+# at low traffic. Apply with:
+#   gcloud run services replace deploy/cloudrun.service.yaml --region asia-southeast1
+# Replace PROJECT_ID, the image and FRONTEND_ORIGIN first. Secrets come from
+# Secret Manager (see docs/deployment/CLOUD_RUN.md); nothing secret is in this file.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: jarlore-api
+  labels:
+    cloud.googleapis.com/location: asia-southeast1
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"          # scale to zero: no idle cost
+        autoscaling.knative.dev/maxScale: "2"          # hard ceiling on instances (and on DB connections)
+        run.googleapis.com/cpu-throttling: "true"      # request-based billing: CPU only while serving
+        run.googleapis.com/startup-cpu-boost: "false"  # Go starts in milliseconds; no boost needed
+        run.googleapis.com/execution-environment: gen2
+    spec:
+      containerConcurrency: 20   # 2 instances x 4 DB connections; requests queue for a connection
+      timeoutSeconds: 30         # a cold Neon compute resumes well within this
+      serviceAccountName: jarlore-api@PROJECT_ID.iam.gserviceaccount.com
+      containers:
+        - image: asia-southeast1-docker.pkg.dev/PROJECT_ID/jarlore/jarlore-api:VERSION
+          ports:
+            - name: http1
+              containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          env:
+            - { name: APP_ENV, value: production }
+            - { name: LOG_LEVEL, value: info }
+            - { name: DB_MAX_CONNS, value: "4" }
+            - { name: REQUEST_TIMEOUT, value: 15s }
+            - { name: FRONTEND_ORIGIN, value: "https://app.jarlore.example" }
+            # Neon Auth: iss = aud = origin of NEON_AUTH_BASE_URL; JWKS under the full base URL
+            - { name: AUTH_ISSUER, value: "https://NEON_AUTH_HOST" }
+            - { name: AUTH_JWKS_URL, value: "https://NEON_AUTH_HOST/neondb/auth/.well-known/jwks.json" }
+            - { name: BILLING_BETA_PRO_FOR_ALL, value: "false" }
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: jarlore-database-url, key: latest } }
+            - name: CURSOR_SIGNING_SECRET
+              valueFrom: { secretKeyRef: { name: jarlore-cursor-secret, key: latest } }
+          # Liveness never touches the database, so a suspended Neon compute can't
+          # get healthy instances killed. Readiness of the DB is /health/ready (for humans and uptime checks).
+          startupProbe:
+            httpGet: { path: /health/live, port: 8080 }
+            periodSeconds: 2
+            failureThreshold: 5
+            timeoutSeconds: 1
+          livenessProbe:
+            httpGet: { path: /health/live, port: 8080 }
+            periodSeconds: 60
+            failureThreshold: 3
+            timeoutSeconds: 2
+  traffic:
+    - percent: 100
+      latestRevision: true

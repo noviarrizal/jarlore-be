@@ -1,6 +1,6 @@
 # API Contract
 
-The machine-readable contract is [`docs/api/openapi.yaml`](../api/openapi.yaml) (OpenAPI 3.1). This document explains the conventions. When the two disagree, fix one of them in the same change; the frontend codes against the OpenAPI shapes.
+The machine-readable contract is [`api/openapi.yaml`](../../api/openapi.yaml) (OpenAPI 3.1). This document explains the conventions. When the two disagree, fix one of them in the same change; the frontend codes against the OpenAPI shapes.
 
 ## 1. Principles
 
@@ -32,7 +32,7 @@ The machine-readable contract is [`docs/api/openapi.yaml`](../api/openapi.yaml) 
 
 ## 4. Authentication
 
-- `Authorization: Bearer <JWT>` on every `/v1` route. The JWT is issued by the auth provider (proposed: Supabase Auth; ADR-003).
+- `Authorization: Bearer <JWT>` on every `/v1` route. The JWT is issued by Neon Auth (EdDSA; ADR-003).
 - The API verifies signature against the provider JWKS (cached, refreshed on unknown `kid`), plus `iss`, `aud`, `exp` (with ≤ 60 s clock skew) and `sub`.
 - The first authenticated request lazily creates the `profiles` row (`id = sub`, `email` from claims). Email is re-synced when the claim changes.
 - No cookies are used by the API, so CSRF does not apply. CORS allows only `FRONTEND_ORIGIN`.
@@ -174,3 +174,31 @@ Responses include `RateLimit-Policy` and `RateLimit` headers (IETF draft) and `R
 - **`DELETE /v1/measurement-definitions/{id}`**: returns `{id, outcome:'deleted'}` if unused, else archives and returns `{id, outcome:'archived'}`.
 - **`GET /v1/billing/portal`**: 404 `not_found` when the user has no provider customer.
 - **`POST /v1/billing/checkout`**: 409 `subscription_exists` if an active subscription exists (use the portal to change plan).
+
+## 13. Implementation status (Go API, 2026-11-07)
+
+Served now (every one is covered by tests; the core workflow responses are validated against the spec):
+
+| Area | Endpoints |
+|---|---|
+| Health | `GET /health/live`, `GET /health/ready`, `GET /openapi.yaml` (no auth) |
+| Me | `GET/PATCH /v1/me`, `GET /v1/entitlements` |
+| Reference | `GET /v1/fermentation-types`, `GET/POST /v1/measurement-definitions` |
+| Today | `GET /v1/today` |
+| Batches | `GET/POST /v1/batches`, `POST /v1/batches/diff-preview`, `GET/PATCH /v1/batches/{id}`, `GET .../snapshot`, `GET .../brew-again`, `GET .../reference`, `POST .../finish`, `.../discard`, `.../archive`, `.../unarchive`, `.../save-as-recipe` |
+| Bottles | `POST /v1/batches/{id}/bottles`, `POST /v1/bottles/diff-preview`, `PATCH /v1/bottles/{id}`, `POST /v1/bottles/{id}/finish`, `POST /v1/bottles/{id}/save-as-recipe` |
+| Logs | `GET/POST /v1/batches/{id}/logs`, `DELETE /v1/logs/{id}` |
+| Recipes | `GET /v1/recipes` (`scope` filter), `GET/PATCH /v1/recipes/{id}`, `GET .../versions`, `GET .../versions/{no}`, `GET .../diff`, `GET .../batches`, `GET /v1/recipe-versions/{id}` |
+| Compare | `POST /v1/compare` |
+| Reminders | `GET /v1/reminders` (`status`, `batchId`, `from`, `to`), `PATCH /v1/reminders/{id}` |
+
+Planned (marked `x-implementation-status: planned` in the spec; the routes answer 404, or 405 where the path exists for other methods): `DELETE /v1/me`, `PATCH/DELETE /v1/measurement-definitions/{id}`, `POST /v1/reminders`, calendar feed, exports, billing checkout/portal, billing webhooks.
+
+Behaviour worth knowing:
+
+- **Idempotency** is accepted on `POST /v1/batches`, `/bottles`, `/finish` (batch and bottle), `/save-as-recipe` (batch and bottle) and required on logs. Replays return the stored bytes with `Idempotent-Replayed: true`. A concurrent duplicate gets 409 `idempotency_in_progress`.
+- **Diff rows** carry `category` (recipe, variation, environment, measurement, outcome). Ingredients show absolute amounts (g, ml, or L for large volumes) when all items have the same volume, otherwise per litre (g/L, ml/L); equality is always judged per litre. Bottle additions compare per bottle; amounts in different dimensions (15 ml vs 30 g) compare as text. Temperatures use the user's `tempUnit`. Durations of 3 days or more are whole days.
+- **Diff keys:** `ingredients.<role>.<name_slug>`, `params.targetF1Days|roomTempC|starterSource`, `additions.flavorName`, `additions.<name_slug>.form|amount`, `additions.primingSugarG`, `process.volumeMl|bottleVolumeMl|headspaceCm|vessel|f1Days|f2Days|bottleCount`, `recipe.version`, `measurements.<key>.last|first`, `result.overall|fizz|sweetTart|flavor|wouldRepeat|offNotes`. A name slug is the name lower-cased with whitespace collapsed to `_`.
+- **Compare limits:** free plan 2 items, Pro 6, except that the bottles of one batch can always be compared together.
+- **Errors:** a malformed path id answers 404 like another user's id. Unknown body fields answer 422 `validation_failed`. Database failures never leak; an unreachable or resuming database answers 503 `unavailable`.
+- **Rate limits** (section 9) are not implemented yet.

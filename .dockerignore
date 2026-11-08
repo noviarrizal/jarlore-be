@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+docs
+scripts
+**/*_test.go
+tmp
+bin
